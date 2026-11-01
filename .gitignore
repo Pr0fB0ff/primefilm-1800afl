@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+out/
+*.tif
+*_raw.bin
+*_preview.png
