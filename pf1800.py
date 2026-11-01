@@ -67,6 +67,11 @@ BACKLASH_OVERSHOOT = 100  # steps a move toward home overshoots before coming ba
 # periods; 0xBB 3 (148 lines/s) always overruns, 0xBB 4 (118 lines/s) overran once in seven frames (roll18), 0xBB 5
 # (98 lines/s, 530 KB/s, about 18 s for 1800 lines) leaves a third of the bus spare. 16-bit colour streams 48 lines/s.
 GREY_BB = 5  # 0xBB for 16-bit grey; 0xC8 is GREY_BB + 1, as the vendor pairs them
+# The byte in 0x88 and 0xC6 sets the line time, which is proportional to 256 minus the byte, and so the light each line
+# gathers (noise1). A strip's frames run at LONG_LINE: at 0x90 with the gain cut to match, signal to noise on dense film is
+# about twice that at LINE_PERIOD, the dark noise not rising with the time, for 39 s a frame against 18. Open light tops
+# out near 30000 at gain 0, past about 0x90, and 0xE8 is too fast (the stream breaks).
+LINE_PERIOD, LONG_LINE = 0xCB, 0x90
 SLIP_CLEAN, SLIP_NOISE, SLIP_LOOK = 0.8, 0.5, 8  # byte-slip repair (repair_slips): neighbouring lines of a picture or an
 # empty gate correlate above 0.9, lines after a slip around 0; SLIP_LOOK lines decide
 # Proof scans at 300 dpi (8-bit grey only): the vendor's table for 300 dpi is
@@ -516,6 +521,11 @@ def frame_columns(frame):
     return np.mean([np.frombuffer(line, "<u2")[::-1][:WIDTH] for line in frame.lines], axis=0)
 
 
+def line_exposure(period):
+    """The light a line gathers at line period byte `period`, against LINE_PERIOD."""
+    return (256 - period) / (256 - LINE_PERIOD)
+
+
 def falloff_gain(columns):
     """The gain per column that flattens the light along the CCD, from frame_columns() of an open-light scan: the lit
     columns' median over their smoothed level, at most FALLOFF_MOST; 1 outside the lit columns (the gate mask)."""
@@ -889,6 +899,7 @@ class PF1800:
         self.tr = None
         self.position = None  # steps past the reference edge, None while unknown
         self.speed = SPEED  # byte of register 0x88 for carriage moves (probe_move_speed.py tries others)
+        self.line = LINE_PERIOD  # byte of registers 0x88 and 0xC6 for scans (scan_frames() lengthens a strip's frames)
         self.lamp_is_on = False
         self.lamp_level = LAMP_LEVEL  # first byte of SetLamp (register 0x8D, bank 0x20); the vendor's lamp calibration lowers it
         self.lens_used = False
@@ -1054,7 +1065,7 @@ class PF1800:
         w(0x80, 0xE1)
 
     def set_scan_acc_dec(self, count, depth=8, grey=False, step=1):
-        """The line period 0xCB and the step count (one motor step per line); register values of the vendor's struct."""
+        """The line period and the step count (one motor step per line); register values of the vendor's struct."""
         w = self.tr.write_reg
         w(0x83, 0x00)
         w(0x85, 0x00)
@@ -1062,7 +1073,7 @@ class PF1800:
         w(0x85, step)  # motor steps per output line
         w(0xBC, 0)
         w(0xBD, 0)
-        speed = PROOF_SPEED if step > 1 else 0xCB
+        speed = PROOF_SPEED if step > 1 else self.line
         w(0x88, speed)
         w(0xC1, 0)
         w(0xC2, 0)
@@ -1587,12 +1598,13 @@ class PF1800:
                  f"{target}")
         return code, slope
 
-    def align_gain(self, frame):
+    def align_gain(self, frame, exposure=1.0):
         """The gain code for strip frames at 1800 dpi from an alignment scan of the strip (`frame`, see align_scan()): the
         highest at which the brightest part (the film base, in the gaps) is expected under PROOF_TARGET, as proof_gain()
         but with no extra pass. Open light past the film's end is left out (OPEN_LIGHT: after a rewind the strip's cut end
         lies in the gate, which set roll40's gain to 6 against roll39's 14; film base reads at most 111 here, open light
-        161 and up). None when most of the scan is open light, or in a dry run."""
+        161 and up). `exposure` is the frame scans' light against the alignment scan's line (line_exposure()). None when
+        most of the scan is open light, or in a dry run."""
         import numpy as np
 
         if self.dry_run or frame is None or not frame.lines:
@@ -1602,7 +1614,7 @@ class PF1800:
         if film.size < samples.size / 2:
             return None
         level = float(np.percentile(film, 99.5))
-        unit = level * 257 * ALIGN_SCALE / grey_gain_factor(ALIGN_GAIN)  # expected 1800 dpi level per unit of gain factor
+        unit = level * 257 * ALIGN_SCALE * exposure / grey_gain_factor(ALIGN_GAIN)  # expected 1800 dpi level per unit of gain
         pick = max((c for c in range(16) if unit * grey_gain_factor(c) <= PROOF_TARGET), default=0)
         self.log(f"alignment: brightest {level:.0f} at gain {ALIGN_GAIN}; gain {pick}, {unit * grey_gain_factor(pick):.0f} "
                  f"expected at 1800 dpi")

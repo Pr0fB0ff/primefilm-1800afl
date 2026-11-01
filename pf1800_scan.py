@@ -40,9 +40,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from pf1800 import (ALIGN_SCAN, BLACK_TARGET, CAL_DARK_AT, CAL_LINES, DEFAULT_LEVELS, FRAME_SCAN, PF1800,
-                    RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns, is_leader,
-                    is_open_light, png_bytes, stretch, tiff_bytes)
+from pf1800 import (ALIGN_SCAN, BLACK_TARGET, CAL_DARK_AT, CAL_LINES, DEFAULT_LEVELS, FRAME_SCAN, LINE_PERIOD, LONG_LINE,
+                    PF1800, RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns, is_leader,
+                    is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
 
 # Autofocus sweep (start, step, count, in lens units from home) for a strip: the feeder holds a strip near focus at +0 to
 # +3 (a slide's emulsion is at +40, so it keeps autofocus()'s full 0 to 75), so 0 to 15 is usually enough and follows curl.
@@ -95,6 +95,7 @@ class ScanOptions:
     flatfield: bool = False
     proof: bool = False  # strip: scan each frame at 300 dpi first and set its 1800 dpi gain from it
     sag: bool = True  # strip: read open light before each frame and scale the frame to frame 1's (pf1800.OPEN_PERCENTILE)
+    line: int = LONG_LINE  # strip: the frames' line period byte, with the strip gain picked for it (pf1800.line_exposure())
     falloff: bool = True  # strip, with sag: flatten the light along the CCD from the first reading (pf1800.falloff_gain())
     settle: bool = True  # grey: warm the lamp until its open light is steady (pf1800.LAMP_SETTLE), `warmup` at least
 
@@ -170,6 +171,7 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
         calibration = scanner.calibrate(opts.depth, gains, opts.offsets, warmup, grey=opts.grey)
         warmup = 0.0
 
+    frame_line = LINE_PERIOD  # the frame scans' line period: a strip's, once its gain is picked for it
     black = {"offsets": None, "slope": None}  # the red offset kept at BLACK_TARGET (strips, see pf1800.black_offset())
     # open light at frame 1, this frame's scale (pf1800.OPEN_PERCENTILE), and the falloff gain from frame 1's reading
     sag = {"on": False, "first": None, "scale": 1.0, "flat": None}
@@ -202,8 +204,12 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
         def full_scan(warmup):
             if before_scan:
                 before_scan()
-            frame = scanner.scan(lines, approach, use, black["offsets"] or opts.offsets, warmup, progress=progress,
-                                 depth=8 if step > 1 else opts.depth, grey=opts.grey, step=step)
+            scanner.line = frame_line
+            try:
+                frame = scanner.scan(lines, approach, use, black["offsets"] or opts.offsets, warmup, progress=progress,
+                                     depth=8 if step > 1 else opts.depth, grey=opts.grey, step=step)
+            finally:
+                scanner.line = LINE_PERIOD  # the other scans keep theirs: open light would saturate
             if black["offsets"] and frame.lines:  # take the black level off, and move the offset toward BLACK_TARGET
                 level = scanner.frame_black(frame)
                 if level is not None:
@@ -264,10 +270,11 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
     # every frame shares one gain and one level scale. Only when the gain was picked from open light above (no --gains),
     # without the proof (which sets each frame's own) and without flat-field correction (calibrated at that gain).
     if opts.grey and opts.gains is None and not opts.proof and calibration is None and step == 1:
-        code = scanner.align_gain(getattr(scanner, "last_align", None))
+        code = scanner.align_gain(getattr(scanner, "last_align", None), line_exposure(opts.line))
         if code is not None:
             log(f"strip gain {code} from the first alignment (open light gave {gains[0]})")
             gains = (code,) * 3
+            frame_line = opts.line
     # the black level, at that gain: the fixed offsets clip the densest negative to 0 at gain 15 (roll36e)
     if opts.grey and opts.depth == 16 and opts.offsets is None and not opts.proof and calibration is None and step == 1:
         found = scanner.black_offset(gains, ALIGN_SCAN[1])
@@ -324,6 +331,9 @@ def main(argv=None):
     ap.add_argument("--gains", type=triple, default=None,
                     help="AFE gains R,G,B (each 0..15; default: picked from open light, or per --depth with --rgb)")
     ap.add_argument("--offsets", type=triple, default=None, help="AFE offsets R,G,B (default per --depth)")
+    ap.add_argument("--line", type=lambda v: int(v, 0), default=LONG_LINE, metavar="BYTE",
+                    help=f"strip: the frames' line period byte, 0x73 to {LINE_PERIOD:#x}: lower gathers more light and is "
+                         f"slower, the gain picked to match (default {LONG_LINE:#x}, about twice the light and the time)")
     ap.add_argument("--no-falloff", action="store_true",
                     help="strip: do not flatten the light along the CCD (about 5 to 12 %% at the frame's ends)")
     ap.add_argument("--warmup", type=float, default=10.0,
@@ -362,7 +372,7 @@ def main(argv=None):
                        dpi=args.dpi, lines=args.lines, approach=args.approach, depth=args.depth, rgb=args.rgb,
                        colour=args.colour, gains=args.gains, offsets=args.offsets, warmup=args.warmup,
                        autofocus=args.autofocus, focus=args.focus, flatfield=args.flatfield, proof=args.proof,
-                       sag=not args.no_sag, falloff=not args.no_falloff, settle=not args.no_settle)
+                       sag=not args.no_sag, line=args.line, falloff=not args.no_falloff, settle=not args.no_settle)
     try:
         opts.check()
     except ValueError as e:

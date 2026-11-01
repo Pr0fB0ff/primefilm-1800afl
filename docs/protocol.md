@@ -195,7 +195,7 @@ B6=01 B7=00 B8=end low B9=end high
 check page 0 bit 1
 C0=00 84=00 84=B1 80=E1                                  motor on
 83=00 85=00 83=20 85=01 BC=00 BD=00                      motor steps per line = 1
-88=CB C1=00 C2=00 C3=01 C6=CB C7=00 C8=04                line period
+88=CB C1=00 C2=00 C3=01 C6=CB C7=00 C8=04                line period (see below)
 C0=C0 89=count low 86=count high                         count = lines * steps per line + 2
 check page 0 bit 1
 BB=03 9B=14 8E=00 8B=00 BF=00 90=00 91=00 83=82
@@ -255,6 +255,27 @@ the rest of the stream at the offset between -3 and +3 bytes that makes the line
 `lines * 6 + 2`. Lines must be read one per bulk transfer: 8192-byte chunks scramble them. Each line is 448 samples plus 0 to 30
 extra at its start, and ends with a marker of 11 zero samples, so take the samples before each marker (`sync_proof_lines()`).
 16-bit mono at 300 dpi gave noise.
+
+### Line period
+
+The byte in `88` and `C6` sets the line time, which is proportional to 256 minus the byte, and with one motor step per line it
+paces the carriage too. It is also the exposure. Measured at `BB` 5:
+
+| byte | line time | lines/s | open light, gain 0 | dark noise, gain 15 |
+|---|---|---|---|---|
+| `CB` | 1.0 | 98 | 17700 | 490 |
+| `B0` | 1.5 | 65 | 24500 | 489 |
+| `90` | 2.1 | 46 | 28700 | 491 |
+| `73` | 2.7 | 37 | 30000 | 489 |
+| `E8` | | | the stream breaks | |
+
+So a longer line is more light with no more dark noise, and it stops gaining in open light near 30000 at gain 0. On film, the
+same frame scanned twice at each setting, `90` at gain 7 gave about twice the signal to noise of `CB` at gain 15 in dense film
+(1.4 times at the thinnest), with no change in geometry. The gain has to come down with it: `90` at gain 10 clipped 61 % of a
+thin frame. The dark noise does fall with the gain: 524 at gain 15, 403 at gain 10, 301 at gain 7.
+
+The driver scans a strip's frames at `90` (`--line`), with the strip gain picked for that light. Open light, alignment and
+autofocus stay at `CB`. Other scans stay at `CB` too.
 
 ### Front end levels
 
