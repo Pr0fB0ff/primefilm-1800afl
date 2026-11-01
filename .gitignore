@@ -5,3 +5,5 @@ out/
 *.tif
 *_raw.bin
 *_preview.png
+*.egg-info/
+build/

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "primefilm-1800afl"
+version = "0.1.0"
+description = "Userspace driver for the Pacific Image PrimeFilm 1800 AFL film scanner"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-2.0-or-later"}
+dependencies = ["pyusb", "numpy"]
+
+[project.urls]
+Homepage = "https://github.com/Pr0fB0ff/primefilm-1800afl"
+
+[project.scripts]
+pf1800-scan = "pf1800_scan:main"
+
+[tool.setuptools]
+py-modules = ["pf1800", "pf1800_scan"]

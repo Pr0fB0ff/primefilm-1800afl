@@ -26,18 +26,20 @@ stuck, a power cycle backs it out.
 You need Python 3 and libusb (`brew install libusb` on macOS).
 
 ```sh
-pip install -r requirements.txt
+pip install git+https://github.com/Pr0fB0ff/primefilm-1800afl@v0.1.0
 ```
+
+To work on the driver, clone the repository and run `pip install -e .` inside it.
 
 On Linux you will probably also need a udev rule to reach the device without root. This has not been tried.
 
 ## Use
 
 ```sh
-python3 pf1800_scan.py out/slide --dry-run        # print every USB transfer, move nothing
-python3 pf1800_scan.py out/slide --autofocus      # scan a mounted slide
-python3 pf1800_scan.py out/roll --strip --autofocus   # scan a strip the feeder has caught, then eject it
-python3 pf1800_scan.py --help
+pf1800-scan out/slide --dry-run      # print every USB transfer, move nothing
+pf1800-scan out/slide --autofocus    # scan a mounted slide
+pf1800-scan out/roll --strip --autofocus  # scan a strip the feeder has caught, then eject it
+pf1800-scan --help
 ```
 
 Push a strip into the entrance and the feeder takes it by itself. Cut off an uncut roll's fogged leader first. Keep the film
