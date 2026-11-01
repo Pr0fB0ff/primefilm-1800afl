@@ -1140,9 +1140,11 @@ class PF1800:
         return None if value is None else bool(value & 0x40)
 
     def reference(self):
-        """Release the home zone going away: the position is then 0 at the exit edge."""
+        """Release the home zone going away: the position is then 0 at the exit edge. A carriage out of the zone (a run
+        killed before it could park) is homed first."""
         if self.in_home_zone() is False:
-            raise ScannerError("the carriage is not in the home zone: call seek_home() first")
+            self.log("the carriage is not in the home zone: homing it first")
+            self.seek_home()
         self._prepare_motor()
         self.motor_move(0, 200)
         took = self._wait(lambda s: not s & 0x40, 2.5, "the release of the home zone")

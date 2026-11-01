@@ -152,7 +152,7 @@ the position.
 
 **Home**: a move toward home of up to 4000 steps, polling until page 0 bit 6 is set. Only do this from past the home zone.
 
-**Reference**: from inside the home zone, a 200-step move away from home, polling until bit 6 clears (about 85 steps), then stop.
+**Reference**: from inside the home zone, a 200-step move away from home, polling until bit 6 clears (about 85 steps), then stop. A carriage found outside the zone, as a run killed before it parked leaves it, is homed first.
 That point is position 0.
 
 **Backlash**: reversing leaves the carriage about 45 steps further out than commanded, so reach every position moving away from
