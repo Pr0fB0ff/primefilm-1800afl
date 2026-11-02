@@ -72,6 +72,12 @@ def save(frame: Frame, prefix: Path, colour=False):
           f"{frame.dpi} dpi), {prefix}_raw.bin, {prefix}_preview.png")
 
 
+# Open light is read (a seek home, a 64-line scan and the way back out, about 8 s) before the first SAG_EVERY_FROM frames, while
+# the lamp settles, then every `sag_every` frames; the frames between take the trend of the last two readings, held within
+# SAG_EXTRAPOLATE of the last. Simulated on roll38 and roll41 to roll44 (the readings along each roll, every third taken):
+# the estimate is off by 0.25 to 0.5 % on average and 1 to 4 % at most, where the reading itself is steady to 0.1 %.
+SAG_EVERY, SAG_EVERY_FROM, SAG_EXTRAPOLATE = 3, 3, 0.03
+
 @dataclass
 class ScanOptions:
     """What to scan and how; shared by the command line and the GUI. `lines` and `approach` apply to a slide only (a strip
@@ -96,6 +102,7 @@ class ScanOptions:
     proof: bool = False  # strip: scan each frame at 300 dpi first and set its 1800 dpi gain from it
     sag: bool = True  # strip: read open light before each frame and scale the frame to frame 1's (pf1800.OPEN_PERCENTILE)
     line: int = LONG_LINE  # strip: the frames' line period byte, with the strip gain picked for it (pf1800.line_exposure())
+    sag_every: int = SAG_EVERY  # strip, with sag: frames between open-light readings (the rest are extrapolated), 1 = every frame
     falloff: bool = True  # strip, with sag: flatten the light along the CCD from the first reading (pf1800.falloff_gain())
     settle: bool = True  # grey: warm the lamp until its open light is steady (pf1800.LAMP_SETTLE), `warmup` at least
 
@@ -174,7 +181,7 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
     frame_line = LINE_PERIOD  # the frame scans' line period: a strip's, once its gain is picked for it
     black = {"offsets": None, "slope": None}  # the red offset kept at BLACK_TARGET (strips, see pf1800.black_offset())
     # open light at frame 1, this frame's scale (pf1800.OPEN_PERCENTILE), and the falloff gain from frame 1's reading
-    sag = {"on": False, "first": None, "scale": 1.0, "flat": None}
+    sag = {"on": False, "first": None, "scale": 1.0, "flat": None, "reads": []}  # reads: (frame n, level)
 
     def scan_one(n, kind, warmup):
         use = gains
@@ -190,7 +197,14 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
         if sag["on"]:  # open light now, against frame 1's: the frame (and a rescan of it) is scaled back to that level
             if before_scan:
                 before_scan()
-            level = scanner.open_level()
+            reads = sag["reads"]
+            if n <= SAG_EVERY_FROM or len(reads) < 2 or n - reads[-1][0] >= opts.sag_every:
+                level = scanner.open_level()
+                if level:
+                    reads.append((n, level))
+            else:  # between readings: carry the trend of the last two on, within SAG_EXTRAPOLATE of the last (a seek home
+                (n0, l0), (n1, l1) = reads[-2:]  # and back costs about 8 s a frame; the sag is slow, see SAG_EVERY)
+                level = min(max(l1 + (l1 - l0) / (n1 - n0) * (n - n1), l1 * (1 - SAG_EXTRAPOLATE)), l1 * (1 + SAG_EXTRAPOLATE))
             if level:
                 if sag["first"] is None:
                     sag["first"] = level
@@ -361,6 +375,9 @@ def main(argv=None):
     ap.add_argument("--monitor-rest", type=float, default=0.0, metavar="MIN",
                     help="with --monitor: after the strip, turn the lamp off for MIN minutes, then read again at "
                          + ", ".join(str(m) for m in MONITOR_REST) + " minutes after relighting")
+    ap.add_argument("--sag-every", type=int, default=SAG_EVERY, metavar="N",
+                    help="strip: read open light every N frames and extrapolate in between (default %(default)s; 1 = every "
+                         "frame)")
     ap.add_argument("--no-sag", action="store_true",
                     help="strip: do not read open light before each frame to scale it to frame 1's level (the lamp "
                          "sags about 14 %% along a roll; the reading takes a few seconds a frame)")
@@ -372,7 +389,8 @@ def main(argv=None):
                        dpi=args.dpi, lines=args.lines, approach=args.approach, depth=args.depth, rgb=args.rgb,
                        colour=args.colour, gains=args.gains, offsets=args.offsets, warmup=args.warmup,
                        autofocus=args.autofocus, focus=args.focus, flatfield=args.flatfield, proof=args.proof,
-                       sag=not args.no_sag, line=args.line, falloff=not args.no_falloff, settle=not args.no_settle)
+                       sag=not args.no_sag, sag_every=max(1, args.sag_every), line=args.line,
+                       falloff=not args.no_falloff, settle=not args.no_settle)
     try:
         opts.check()
     except ValueError as e:
