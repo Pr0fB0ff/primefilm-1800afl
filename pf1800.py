@@ -188,6 +188,12 @@ OVER_OK, BACK_TO, BACK_MAX, BACK_TIMES = 20, 400, 4, 2  # a frame edge more than
 CHECK_AGREE = 60  # a check scan more than this from the hole reads' measure is not believed: the holes measure the film to a
 # few pixels, a check scan can be fooled both ways (roll36e frame 22: a pale wall read 45 where the holes said -213, so no
 # back-off and the frame lost 650 px; the roll simulation: 30 read as -24, a needless back-off)
+OVERLAP_UNITS, OVERLAP_EXPECT, OVERLAP_MIN_RETURN = 4, 1250, 1000  # feed_forward() after a scan: this many coarse units are sent
+# while the carriage returns to the hole row (4 s, of which the units need 2.4: probe_overlap4.py, 5.5 s against 8.4 s for the
+# plain sequence) and one hole read measures them. hole_travel() folds on the perforation pitch, so it is right only within
+# 170 px of OVERLAP_EXPECT; four units go 1080 to 1345 px (1445 logged pairs: 1267 +- 51, the short side is the tail), which
+# a window of 1250 +- 170 holds all but about 0.5 % of the time, and then the check scan disagrees with the holes
+# the carriage must have this far to return (steps) for the overlap to be worth its extra move
 PREDICT_AT = 35  # where a predicted advance aims the edge (a little before EDGE_AT: the pitch scatters by about 20 px, and an
 # edge landing early costs nothing until it passes the gate start, a late one costs a second feed and check scan)
 PREDICT_LEFT, PREDICT_NEXT = 150, 100  # advance without an alignment scan (predict_edge()): needs the frame's own left edge
@@ -911,6 +917,7 @@ class PF1800:
         self.mcu_wait = MCU_WAIT_S  # seconds one MCU handshake step may take (firmware_version's retry allows longer)
         self.tr = None
         self.position = None  # steps past the reference edge, None while unknown
+        self._rest_holes = None  # the holes of the last hole read while the film has not moved since (mcu_command() clears it)
         self.speed = SPEED  # byte of register 0x88 for carriage moves (probe_move_speed.py tries others)
         self.line = LINE_PERIOD  # byte of registers 0x88 and 0xC6 for scans (scan_frames() lengthens a strip's frames)
         self.lamp_is_on = False
@@ -1239,6 +1246,8 @@ class PF1800:
         """A command code (repeated while the reply is 5, busy), then for cmd 0 the sub-command after reply 2.
         The vendor repeats a busy command without limit; a long lens move (homing from +120 units) keeps it busy for a
         while, so this retries for up to MCU_BUSY_S seconds."""
+        if cmd in (1, 2, 6):  # fine, coarse and coarse back feed units: the film moves
+            self._rest_holes = None
         t0 = time.time()
         while True:
             reply = self._mcu_code(cmd)
@@ -1653,6 +1662,10 @@ class PF1800:
         self.go_to(STRIP_PARK)
         for cmd in cmds:
             self.mcu_command(cmd)
+        self._check_sensors()
+
+    def _check_sensors(self):
+        """Log a change of the film sensors; EndOfFilm once page B bits 7 and 6 are both clear."""
         sensors = self.film_sensors()
         if sensors is None:
             return
@@ -1672,7 +1685,27 @@ class PF1800:
             time.sleep(warmup)
         lines = [self._read_stationary(n > 0) for n in range(2)]  # the first line after a setup is the vendor's discard
         self.safe_initial_chip()
-        return None if lines[1] is None else whole_holes(line_red(lines[1]))
+        self._rest_holes = None if lines[1] is None else whole_holes(line_red(lines[1]))
+        return self._rest_holes
+
+    def _return_feeding(self, units):
+        """Back to the hole row (the way go_to() does it) with `units` coarse units sent right after the move starts: the
+        MCU runs them on its own while the carriage moves (probe_overlap.py: no steps lost, the film travels as usual)."""
+        steps = self.position - STRIP_PARK + BACKLASH_OVERSHOOT
+        self._prepare_motor()
+        self.speed = RETURN_SPEED
+        try:
+            self.motor_move(1, steps)
+        finally:
+            self.speed = SPEED
+        for _ in range(units):
+            self.mcu_command(2)
+            self.mcu_command(7)
+        self._wait(lambda s: s & 0x03 == 0x03, steps / 250 + 3, f"the {steps}-step move")
+        self.stop_motor()
+        self.move(0, BACKLASH_OVERSHOOT)
+        self.position = STRIP_PARK
+        self._check_sensors()
 
     def _measure(self, last, expect, what):
         """A hole read and the travel since `last` (expected about `expect`); the nominal travel when no hole shows."""
@@ -1691,16 +1724,29 @@ class PF1800:
         COARSE_LEFT remain, then fine units (command 1) in up to FINE_ROUNDS rounds of FINE_MAX to within `tolerance`.
         Never feeds back, so it can overshoot by up to one fine round's error. Returns the measured travel (None in a dry run).
 
+        After a scan (the carriage far from the hole row) the first OVERLAP_UNITS coarse units are sent during the carriage's
+        return and measured against the holes read before the scan, one read for all.
+
         Fine units give only a limited travel after the last coarse unit and then stall. Then, when `over_ok` and
         `short_ok` are given (how far the feed may overshoot or fall short before something is lost), one more coarse unit
         is fed if it loses less than stopping short does; otherwise the feed stops where it is."""
-        last = self._hole_read(warmup)
+        rest = self._rest_holes
+        overlap = (not self.dry_run and rest and not warmup and self.position is not None
+                   and self.position - STRIP_PARK >= OVERLAP_MIN_RETURN
+                   and px > OVERLAP_UNITS * COARSE_PX + COARSE_LEFT + 100)
+        if not overlap:
+            last = self._hole_read(warmup)
         if self.dry_run:
             self._feed((2, 7))
             self._feed((1,))
             self._hole_read()
             return None
         moved, units = 0.0, 0
+        if overlap:  # the film has not moved since the holes `rest` were read: the first read is the one after the units
+            self._return_feeding(OVERLAP_UNITS)
+            last, d = self._measure(rest, -OVERLAP_EXPECT, f"{OVERLAP_UNITS} coarse units during the return")
+            moved -= d
+            units = OVERLAP_UNITS
         while px - moved > COARSE_LEFT:
             k = 2 if px - moved - COARSE_PX > COARSE_LEFT else 1
             units += k
