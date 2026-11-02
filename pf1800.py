@@ -188,6 +188,10 @@ OVER_OK, BACK_TO, BACK_MAX, BACK_TIMES = 20, 400, 4, 2  # a frame edge more than
 CHECK_AGREE = 60  # a check scan more than this from the hole reads' measure is not believed: the holes measure the film to a
 # few pixels, a check scan can be fooled both ways (roll36e frame 22: a pale wall read 45 where the holes said -213, so no
 # back-off and the frame lost 650 px; the roll simulation: 30 read as -24, a needless back-off)
+PREDICT_AT = 35  # where a predicted advance aims the edge (a little before EDGE_AT: the pitch scatters by about 20 px, and an
+# edge landing early costs nothing until it passes the gate start, a late one costs a second feed and check scan)
+PREDICT_LEFT, PREDICT_NEXT = 150, 100  # advance without an alignment scan (predict_edge()): needs the frame's own left edge
+# within PREDICT_LEFT of the gate start, and, where the next frame's gap shows in the scan too, that to agree within PREDICT_NEXT
 BACK_PX, AFTER_BACK_PX = 260, 240  # expected travel of a coarse unit back, and of the first one forward after it (the
 # hole reads fold toward these: probe52/53 measured 187 to 311 back, 265 forward; probe42 183 forward)
 FINE_STALL = 0.3  # a fine round that moves less than this share of its nominal travel has stalled (the strip's tail has
@@ -841,6 +845,15 @@ def next_edge(r):
         return None
     s, e = gaps[0]
     return e + 1 if e < GATE_END - GATE_TOUCH and e - s < WIDE_GAP else s + GAP_WIDTH
+
+
+def left_edge(r):
+    """A strip frame's own left edge in its scan (`r`: its plane): the right end + 1 of the gap at the gate start. None when
+    none shows (the edge lies before the gate, or the gap is too short for the gap finder)."""
+    for s, e in frame_scan_gaps(r):
+        if s == 0:
+            return e + 1
+    return None
 
 
 def early_edge(r):
@@ -1816,16 +1829,62 @@ class PF1800:
         """Where the frame edge lies after a feed that was to bring it from `before` to EDGE_AT: a short alignment scan
         (ALIGN_SHORT lines). None when that scan shows no edge between CUT_OK before the gate and `before` (the film cannot
         have moved back), so the feed's own measure stands."""
-        edge = frame_edge(align_plane(self.align_scan(lines=ALIGN_SHORT)), 0)
+        self.last_check = self.align_scan(lines=ALIGN_SHORT)
+        edge = frame_edge(align_plane(self.last_check), 0)
         if edge is None or not -CUT_OK <= edge <= before + FEED_TOLERANCE:
             self.log(f"check scan: no edge between {-CUT_OK} and {before} (found {edge}); the feed's measure stands")
             return None
         self.log(f"check scan: edge at {edge}")
         return edge
 
-    def advance_frame(self, pitch_mm=38.0, margin=100, upto=None):
-        """The next frame: feed one frame pitch minus `margin` pixels (so an overshoot cannot skip the gap), or less when
-        the last frame scan showed the next frame's edge already at CCD pixel `upto` (next_frame_edge()), then align."""
+    def predict_edge(self, frame, pitch_mm=38.0):
+        """Where the next frame's left edge lies now, from the frame just scanned: its own left edge (left_edge()) plus the
+        frame pitch. On saved rolls this is within 30 px of the edge the alignment scan found for about 9 frames in 10
+        (median pitch 2729 to 2733 px on six rolls, 38 mm is 2728). None when the scan shows no left edge near the gate start,
+        when the gap after the frame (where it shows) disagrees by more than PREDICT_NEXT, or in a dry run."""
+        if self.dry_run or not frame.lines:
+            return None
+        r = align_plane(frame)
+        left = left_edge(r)
+        if left is None or not 0 < left <= PREDICT_LEFT:
+            return None
+        edge = int(round(left + pitch_mm * PX_PER_MM))
+        seen = next_edge(r)
+        if seen is not None and abs(seen - edge) > PREDICT_NEXT:
+            self.log(f"the next frame's gap in the last scan ({seen}) and the pitch ({edge}) disagree")
+            return None
+        return edge
+
+    def _advance_predicted(self, edge):
+        """Feed the next frame's predicted edge (predict_edge()) to EDGE_AT, closed loop on the holes, and check it with one
+        short scan instead of an alignment scan. Returns the edge as the scan sees it, or None when the scan sees none or
+        differs from the hole reads' measure by more than CHECK_AGREE: then neither is believed and the caller aligns."""
+        self.log(f"the next edge is expected at {edge}: feeding {edge - PREDICT_AT} px")
+        # never a coarse unit past the aim (an overshoot of the gate start is not seen by the check scan, and the alignment
+        # then takes the next frame's gap): a stalled feed stops short, and place_edge() finishes it
+        moved = self.feed_forward(edge - PREDICT_AT, over_ok=PREDICT_AT, short_ok=GATE_END - FRAME_PX - PREDICT_AT)
+        holes = edge if moved is None else round(edge - moved)
+        seen = self._check_edge(edge)
+        if seen is None or abs(seen - holes) > CHECK_AGREE:
+            self.log(f"the check scan ({seen}) and the hole reads ({holes}) do not agree; aligning")
+            return None
+        self.last_align = self.last_check
+        at = self.place_edge(seen)  # leaves an edge near EDGE_AT (or early within OVER_OK) where it is
+        self.log(f"frame edge at {seen}, now at {'?' if at is None else at}, after the predicted advance")
+        return at
+
+    def advance_frame(self, pitch_mm=38.0, margin=100, upto=None, frame=None):
+        """The next frame: with the `frame` just scanned, feed to the edge its pitch predicts (predict_edge()) and check it
+        with a short scan; where that is not possible or the check disagrees, feed one frame pitch minus `margin` pixels (so
+        an overshoot cannot skip the gap), or less when the last frame scan showed the next frame's edge already at CCD
+        pixel `upto` (next_frame_edge()), then align."""
+        self.failed_align = None
+        edge = None if frame is None else self.predict_edge(frame, pitch_mm)
+        if edge is not None:
+            at = self._advance_predicted(edge)
+            if at is not None:
+                return at
+            return self.align_frame(at_least=0)  # the film has moved the pitch already
         px = pitch_mm * PX_PER_MM - margin
         if upto is not None and upto - EDGE_AT - margin < px:
             px = upto - EDGE_AT - margin

@@ -103,6 +103,7 @@ class ScanOptions:
     sag: bool = True  # strip: read open light before each frame and scale the frame to frame 1's (pf1800.OPEN_PERCENTILE)
     line: int = LONG_LINE  # strip: the frames' line period byte, with the strip gain picked for it (pf1800.line_exposure())
     sag_every: int = SAG_EVERY  # strip, with sag: frames between open-light readings (the rest are extrapolated), 1 = every frame
+    predict: bool = False  # strip: advance to the edge the frame pitch predicts and check it with a short scan, not an alignment
     falloff: bool = True  # strip, with sag: flatten the light along the CCD from the first reading (pf1800.falloff_gain())
     settle: bool = True  # grey: warm the lamp until its open light is steady (pf1800.LAMP_SETTLE), `warmup` at least
 
@@ -309,7 +310,8 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
         if (opts.frames and n >= opts.frames) or (scanner.dry_run and n >= 2):  # a dry run shows one advance
             break
         try:
-            scanner.advance_frame(opts.pitch_mm, upto=scanner.next_frame_edge(frame) if frame else None)
+            scanner.advance_frame(opts.pitch_mm, upto=scanner.next_frame_edge(frame) if frame else None,
+                                  frame=frame if opts.predict else None)
             aligned(n + 1)
             kind = "frame"
         except EndOfFilm as e:
@@ -378,6 +380,10 @@ def main(argv=None):
     ap.add_argument("--sag-every", type=int, default=SAG_EVERY, metavar="N",
                     help="strip: read open light every N frames and extrapolate in between (default %(default)s; 1 = every "
                          "frame)")
+    ap.add_argument("--predict", action="store_true",
+                    help="strip: after a frame whose own left edge shows, feed to the edge its pitch predicts and check it "
+                         "with a short scan instead of an alignment scan (about 9 s a frame when it holds; the full "
+                         "alignment follows where it does not). Experimental")
     ap.add_argument("--no-sag", action="store_true",
                     help="strip: do not read open light before each frame to scale it to frame 1's level (the lamp "
                          "sags about 14 %% along a roll; the reading takes a few seconds a frame)")
@@ -389,7 +395,7 @@ def main(argv=None):
                        dpi=args.dpi, lines=args.lines, approach=args.approach, depth=args.depth, rgb=args.rgb,
                        colour=args.colour, gains=args.gains, offsets=args.offsets, warmup=args.warmup,
                        autofocus=args.autofocus, focus=args.focus, flatfield=args.flatfield, proof=args.proof,
-                       sag=not args.no_sag, sag_every=max(1, args.sag_every), line=args.line,
+                       sag=not args.no_sag, sag_every=max(1, args.sag_every), predict=args.predict, line=args.line,
                        falloff=not args.no_falloff, settle=not args.no_settle)
     try:
         opts.check()
