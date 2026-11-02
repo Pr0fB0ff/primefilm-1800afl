@@ -318,14 +318,15 @@ place. To send code `c`, with `v = c << 2`:
 83=00 A3=1E A1=v                     (one control transfer)
 A1=v|2
 A1=v
-poll page 0x0A until bit 0 is 0      keep this first reading: it is the reply
+poll page 0x0A until bit 0 is 0      the reading with bit 0 clear is the reply
 83=00 A3=1E A1=v|2
 poll page 0x0A until bit 0 is 1
 ```
 
-Each poll is the page 0x0A read, `97=0A A3=1E`, then 0x8B twice. The reply code is bits 4 to 2 of the kept reading: 5 is busy
-(send the command again; a long lens move keeps it busy for a while), 2 is "go on" (for command 0, send the sub-command as a second
-code).
+Each poll is the page 0x0A read, `97=0A A3=1E`, then 0x8B twice. The reply code is bits 4 to 2 of the reading with bit 0 clear; an
+earlier poll with bit 0 still set shows the idle level, whose bits are no reply. 5 is busy (send the command again; a long lens move
+keeps it busy for a while), 2 is "go on" (for command 0, send the sub-command as a second code). Any other reply to command 0
+means the sub-command must not be sent, and the lens does not move.
 
 | code | action |
 |---|---|

@@ -1236,7 +1236,9 @@ class PF1800:
         self.tr.write_regs((0x97, 0x0A), (0xA3, 0x1E))
         return self.tr.read_reg(0x8B, twice=True)
 
-    def _wait_bit0(self, want):
+    def _wait_bit0(self, want, code=None):
+        """Polls until bit 0 is `want` and returns that reading: the first poll can still be the idle level, whose bits
+        4..2 are no reply. With `code`, says so when it was (a late reply, which an MCU kept busy is most likely to give)."""
         if self.dry_run:
             return None
         t0, first, value, told = time.time(), None, None, False
@@ -1244,7 +1246,9 @@ class PF1800:
             value = self._poll_a()
             first = value if first is None else first
             if value & 1 == want:
-                return first
+                if code is not None and first & 1 != want:
+                    self.log(f"MCU code {code}: late reply 0x{value:02X} (first poll 0x{first:02X})")
+                return value
             if not told and time.time() - t0 > MCU_WAIT_S:
                 told = True
                 self.log(f"the MCU has not answered for {MCU_WAIT_S:.0f} s (status 0x{value:02X}); "
@@ -1257,7 +1261,7 @@ class PF1800:
         self.tr.write_regs((0x83, 0), (0xA3, 0x1E), (0xA1, v))
         self.tr.write_regs((0xA1, v | 2))
         self.tr.write_regs((0xA1, v))
-        reply = self._wait_bit0(0)
+        reply = self._wait_bit0(0, code)
         self.tr.write_regs((0x83, 0), (0xA3, 0x1E), (0xA1, v | 2))
         self._wait_bit0(1)
         return None if reply is None else (reply & 0x1C) >> 2
@@ -1265,7 +1269,8 @@ class PF1800:
     def mcu_command(self, cmd, sub=None):
         """A command code (repeated while the reply is 5, busy), then for cmd 0 the sub-command after reply 2.
         The vendor repeats a busy command without limit; a long lens move (homing from +120 units) keeps it busy for a
-        while, so this retries for up to MCU_BUSY_S seconds."""
+        while, so this retries for up to MCU_BUSY_S seconds. Any other reply to cmd 0 is an error: the lens would not move
+        and nothing else would show it."""
         t0 = time.time()
         while True:
             reply = self._mcu_code(cmd)
@@ -1274,8 +1279,12 @@ class PF1800:
             if time.time() - t0 > MCU_BUSY_S:
                 raise ScannerError(f"the MCU kept answering busy for {MCU_BUSY_S} s")
             time.sleep(0.1)
-        if cmd == 0 and sub is not None and (reply is None or reply == 2):
-            self._mcu_code(sub)
+        if cmd == 0 and sub is not None:
+            if reply not in (None, 2):
+                raise ScannerError(f"the MCU refused lens command {sub}: reply code {reply}")
+            answer = self._mcu_code(sub)
+            if answer not in (None, 4):
+                self.log(f"MCU: lens command {sub} answered code {answer}")
 
     def firmware_version(self):
         """The command 4 handshake twice; the version is in status bits 4..2 of the second pass. The first
@@ -1299,7 +1308,7 @@ class PF1800:
         self.tr.write_regs((0xA1, v | 2))
         self.tr.write_regs((0xA1, v))
         self.tr.write_regs((0x83, 0))
-        status = self._wait_bit0(0)
+        status = self._wait_bit0(0, 4)
         self.tr.write_regs((0x83, 0), (0xA3, 0x1E), (0xA1, v | 2))
         self._wait_bit0(1)
         return None if status is None else (status & 0x1C) >> 2
