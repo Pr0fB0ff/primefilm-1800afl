@@ -387,8 +387,13 @@ Three behaviours shape everything else:
 
 1. **Reversing loses a varying slack** of 90 to 190 px. After a reversal fine units hardly move at all until a coarse unit forward takes up the
    slack. Position by feeding forward only, and recover a frame fed too far by going back past it, one coarse unit forward, then fine units.
-2. **Fine units stall at random** along a long roll, and once the strip's tail has left the entrance roller, which is all they drive. The last
-   frames may need a coarse unit, with whatever overshoot it brings.
+2. **Fine units stall at one place against the perforations**, and once the strip's tail has left the entrance roller, which is all they drive.
+   In a run every stall falls with the first hole in one band of the pitch, about 110 px wide, placed differently from run to run. What catches the
+   film is not known. It does not always catch: on a clean strip the film passed about as often as it stopped, on a scratched one it stopped nearly
+   every pitch. Only a coarse unit is sure to pass, and waiting, command 7 or one fine unit back do not help. A coarse unit is about 40 px short of a
+   pitch, so it moves the holes back up the pitch: with holes that would lie in the band, a target has no route that avoids a fine feed across it.
+   Once stalls have placed the band, a hole read warns of a stall before it happens. The last frames may need a coarse unit, with whatever
+   overshoot it brings.
 3. **Hole reads are exact only modulo the pitch.** Expect under half a pitch per round of fine units (about 7 units), or a stall reads as a
    whole perforation.
 

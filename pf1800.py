@@ -1754,9 +1754,9 @@ class PF1800:
         COARSE_LEFT remain, then fine units (command 1) in up to FINE_ROUNDS rounds of FINE_MAX to within `tolerance`.
         Never feeds back, so it can overshoot by up to one fine round's error. Returns the measured travel (None in a dry run).
 
-        Fine units give only a limited travel after the last coarse unit and then stall. Then, when `over_ok` and
-        `short_ok` are given (how far the feed may overshoot or fall short before something is lost), one more coarse unit
-        is fed if it loses less than stopping short does; otherwise the feed stops where it is."""
+        Fine units stall with the holes in one band of the pitch, and only a coarse unit is sure to pass it. Then, when
+        `over_ok` and `short_ok` are given (how far the feed may overshoot or fall short before something is lost), one more
+        coarse unit is fed if it loses less than stopping short does; otherwise the feed stops where it is."""
         last = self._rest_holes or self._hole_read(warmup)  # scans do not move the film, so the read before them still holds
         if self.dry_run:
             self._feed((2, 7))
