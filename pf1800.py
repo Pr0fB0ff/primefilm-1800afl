@@ -166,12 +166,15 @@ EDGE_AT = 45  # CCD pixel where a frame's left edge is placed (the gate shows ab
 MIN_GAP, WIDE_GAP, GAP_FLAT, GAP_BASE, GAP_WIDTH = 60, 250, 8.0, 0.75, 134  # gap finder (see frame_gaps); the base
 # share allows for the lamp falling off toward the ends of the CCD line (a gap at the gate edge reads about 85 % of the base)
 # A scratched film: long scratches run along the film through its gaps, so a gap's columns are not flat over the rows and
-# frame_gaps() misses them. scratched_edge() judges a column by how many of its pixels leave its median instead: at most
-# SCRATCH_NEAR share by more than SCRATCH_OFF[0], at most SCRATCH_FAR by more than SCRATCH_OFF[1] (roll50: real gaps 0.19 to
-# 0.23 and 0.04 to 0.09). Only where frame_gaps() finds no edge at all (used everywhere it brought back roll22's false edge
-# at 1698), and only a whole gap at least SCRATCH_GAP wide with film on both sides: a gap cut by the gate's ends, and thinner
-# runs, were false there (roll48 align25, roll50 align02 at 370 to 435)
-SCRATCH_OFF, SCRATCH_NEAR, SCRATCH_FAR, SCRATCH_GAP = (8, 16), 0.275, 0.09, 100
+# frame_gaps() misses them, but they barely move a median over part of a column. clear_gaps() splits the rows into
+# CLEAR_BANDS bands and takes the runs of columns whose darkest band's median is at least CLEAR_SHARE of the film base,
+# closing breaks up to CLEAR_BRIDGE wide: a gap is clear over every row, where the whole column's median passed bright skin
+# on thin negatives (roll40 frame 37, roll48 align25: darkest band 0.77 and under). Real gaps on roll50 and roll51 read 0.86
+# to 0.90 there, the pale wall beside one 0.79 (roll51 align02, where counting pixels off the median passed the wall and
+# broke the gap). Only where the flatness test finds nothing (used everywhere it brought back roll22's false edge at 1698),
+# and an edge only from a gap cut by the gate start or a whole gap at least SCRATCH_GAP wide with film on both sides: a gap
+# cut by the gate's end, and thinner runs, were false there (roll48 align25, roll50 align02 at 370 to 435)
+CLEAR_SHARE, CLEAR_BANDS, CLEAR_BRIDGE, SCRATCH_GAP = 0.83, 8, 20, 90
 GATE_TOUCH = 25  # a gap ending this close to GATE_END runs into the gate's mask even where mask() cannot see it; with no
 # better inner edge it places the frame before it (roll22 frame 1: a gap ending at 2681 of 2686 was taken for an inner one,
 # a false edge at 1695 was found in bright picture and the whole frame before the gap lost)
@@ -781,23 +784,36 @@ def plausible_gaps(r, gaps):
     return [g for g, (sp, lo) in zip(gaps, stats) if not false(g, sp, lo)]
 
 
-def scratched_edge(r, at_least=0):
-    """The first frame edge at or right of `at_least` by whole gaps of a scratched film (see SCRATCH_OFF), or None."""
+def clear_gaps(r):
+    """Runs (start, end) of clear film in a negative by the columns' median level, for a scratched film (see CLEAR_SHARE)."""
     import numpy as np
 
-    rows = r[:, :GATE_END]
-    level = np.median(rows, axis=0)
-    off = np.abs(rows - level)
-    good = ((off > SCRATCH_OFF[0]).mean(0) <= SCRATCH_NEAR) & ((off > SCRATCH_OFF[1]).mean(0) <= SCRATCH_FAR)
-    good &= level >= GAP_BASE * np.percentile(r, 99.5)
-    start = None
-    for x, ok in enumerate([*good, False]):
+    bands = np.array_split(r[:, :GATE_END], CLEAR_BANDS)
+    level = np.min([np.median(band, axis=0) for band in bands], axis=0)
+    level = np.convolve(np.pad(level, 4, mode="edge"), np.ones(9) / 9, "valid")
+    runs, start = [], None
+    for x, ok in enumerate([*(level >= CLEAR_SHARE * np.percentile(r, 99.5)), False]):
         if ok and start is None:
             start = x
         if not ok and start is not None:
-            if SCRATCH_GAP <= x - start < WIDE_GAP and start > 0 and x - 1 < GATE_END - GATE_TOUCH and x >= at_least:
-                return x
+            if runs and start - runs[-1][1] <= CLEAR_BRIDGE:
+                runs[-1] = (runs[-1][0], x - 1)
+            else:
+                runs.append((start, x - 1))
             start = None
+    return runs
+
+
+def scratched_edge(r, at_least=0):
+    """The first frame edge at or right of `at_least` by whole gaps of a scratched film (see CLEAR_SHARE), or None."""
+    for s, e in clear_gaps(r):
+        if s == 0 and EDGE_GAP <= e + 1 < WIDE_GAP:  # cut by the gate start: its end is the frame's edge (roll52, 0 to 209)
+            return e + 1
+        if SCRATCH_GAP <= e - s + 1 < WIDE_GAP and s > 0 and e < GATE_END - GATE_TOUCH:
+            if -CUT_OK <= s - FRAME_PX <= EDGE_AT:  # the gap after a frame in the gate, as in frame_edge()
+                return s - FRAME_PX
+            if e + 1 >= at_least:
+                return e + 1
     return None
 
 
@@ -824,6 +840,7 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
         # at 234-345 passed for the mask, the gap was taken for the one before the gate end, and the frame was missed)
         return x >= len(level) or (x >= GATE_END - GATE_TOUCH and level[x] < 0.15 * base and spread[x] < 2)
 
+    clear = clear_gaps(r)
     placed, inner, trailing, touching = [], [], [], []
     for s, e in plausible_gaps(r, frame_gaps(r, min_len=EDGE_GAP)):
         if s == 0:  # wider than a gap: gap and pale picture run together, and where the gap ends is unknown; under-feeding
@@ -832,7 +849,9 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
             placed.append(s - FRAME_PX)
         elif e >= GATE_END - GATE_TOUCH:  # runs into the mask unseen; its estimate of the frame edge is the less exact
             touching.append((s - FRAME_PX, dip(s, e)))
-        elif e - s + 1 >= MIN_GAP:
+        elif e - s + 1 >= MIN_GAP and (not clear or any(cs <= e and s <= ce for cs, ce in clear)):
+            # with clear film elsewhere in the gate, a flat run that is not clear film is an even wall (roll52b align02: 2022
+            # to 2123 beside the real gap at 2512, and the frame in the gate between them was fed past)
             inner.append((e + 1 if e - s < WIDE_GAP else s + gap, dip(s, e)))
             if -CUT_OK <= s - FRAME_PX <= EDGE_AT:
                 trailing.append((s, s - FRAME_PX))
@@ -853,13 +872,15 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
 
 def frame_scan_gaps(r):
     """The real gaps in a strip frame scan (`r`: its plane): over the picture rows FRAME_ROWS, scaled to the alignment scan's
-    level so the gap finder's thresholds hold, and no wider than a gap (not open light)."""
+    level so the gap finder's thresholds hold, and no wider than a gap (not open light). By clear_gaps() where the flatness
+    test finds none: on a scratched strip early_edge() and late_edge() would otherwise see nothing (roll51 frames 2 and 3)."""
     import numpy as np
 
     r = r[FRAME_ROWS[0] : FRAME_ROWS[1] : 3, : GATE_END + 64].astype(float)
     r *= 80.0 / max(1.0, float(np.percentile(r[:, :GATE_END], 99.5)))  # film base about 80, as at ALIGN_GAIN
     gaps = plausible_gaps(r, frame_gaps(r, min_len=EDGE_GAP))
-    return [(s, e) for s, e in gaps if (s == 0 or MIN_GAP <= e - s + 1) and e - s + 1 < 400]
+    gaps = [(s, e) for s, e in gaps if (s == 0 or MIN_GAP <= e - s + 1) and e - s + 1 < 400]
+    return gaps or [(s, e) for s, e in clear_gaps(r) if (EDGE_GAP if s == 0 else MIN_GAP) <= e - s + 1 < 400]
 
 
 def next_edge(r):
