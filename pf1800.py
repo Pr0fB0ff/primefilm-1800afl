@@ -165,6 +165,13 @@ EDGE_AT = 45  # CCD pixel where a frame's left edge is placed (the gate shows ab
 # Feeds overshoot and the edge reads early: with 20, frames came out 25 px cut to 13 px clear on the left (roll21 to roll23)
 MIN_GAP, WIDE_GAP, GAP_FLAT, GAP_BASE, GAP_WIDTH = 60, 250, 8.0, 0.75, 134  # gap finder (see frame_gaps); the base
 # share allows for the lamp falling off toward the ends of the CCD line (a gap at the gate edge reads about 85 % of the base)
+# A scratched film: long scratches run along the film through its gaps, so a gap's columns are not flat over the rows and
+# frame_gaps() misses them. scratched_edge() judges a column by how many of its pixels leave its median instead: at most
+# SCRATCH_NEAR share by more than SCRATCH_OFF[0], at most SCRATCH_FAR by more than SCRATCH_OFF[1] (roll50: real gaps 0.19 to
+# 0.23 and 0.04 to 0.09). Only where frame_gaps() finds no edge at all (used everywhere it brought back roll22's false edge
+# at 1698), and only a whole gap at least SCRATCH_GAP wide with film on both sides: a gap cut by the gate's ends, and thinner
+# runs, were false there (roll48 align25, roll50 align02 at 370 to 435)
+SCRATCH_OFF, SCRATCH_NEAR, SCRATCH_FAR, SCRATCH_GAP = (8, 16), 0.275, 0.09, 100
 GATE_TOUCH = 25  # a gap ending this close to GATE_END runs into the gate's mask even where mask() cannot see it; with no
 # better inner edge it places the frame before it (roll22 frame 1: a gap ending at 2681 of 2686 was taken for an inner one,
 # a false edge at 1695 was found in bright picture and the whole frame before the gap lost)
@@ -774,6 +781,26 @@ def plausible_gaps(r, gaps):
     return [g for g, (sp, lo) in zip(gaps, stats) if not false(g, sp, lo)]
 
 
+def scratched_edge(r, at_least=0):
+    """The first frame edge at or right of `at_least` by whole gaps of a scratched film (see SCRATCH_OFF), or None."""
+    import numpy as np
+
+    rows = r[:, :GATE_END]
+    level = np.median(rows, axis=0)
+    off = np.abs(rows - level)
+    good = ((off > SCRATCH_OFF[0]).mean(0) <= SCRATCH_NEAR) & ((off > SCRATCH_OFF[1]).mean(0) <= SCRATCH_FAR)
+    good &= level >= GAP_BASE * np.percentile(r, 99.5)
+    start = None
+    for x, ok in enumerate([*good, False]):
+        if ok and start is None:
+            start = x
+        if not ok and start is not None:
+            if SCRATCH_GAP <= x - start < WIDE_GAP and start > 0 and x - 1 < GATE_END - GATE_TOUCH and x >= at_least:
+                return x
+            start = None
+    return None
+
+
 def frame_edge(r, at_least=0, gap=GAP_WIDTH):
     """The left edge of the frame to align: a frame whose left edge is near the start of the gate (a gap cut by the start
     of the gate ends at its left edge), or a frame already in the gate whose leading gap has gone past the start (the
@@ -821,7 +848,7 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
     for s, left in trailing:  # the gap after a frame in the gate, with no frame edge before it (roll18, roll19)
         if not any(x < s for x, _ in inner):
             return left
-    return inner[0][0] if inner else None
+    return inner[0][0] if inner else scratched_edge(r, at_least)
 
 
 def frame_scan_gaps(r):
