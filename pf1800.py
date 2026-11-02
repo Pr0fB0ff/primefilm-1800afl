@@ -961,6 +961,7 @@ class PF1800:
         self.mcu_wait = MCU_WAIT_S  # seconds one MCU handshake step may take (firmware_version's retry allows longer)
         self.tr = None
         self.position = None  # steps past the reference edge, None while unknown
+        self._rest_holes = None  # the last hole read, while the film has not moved since (mcu_command() clears it)
         self.speed = SPEED  # byte of register 0x88 for carriage moves (probe_move_speed.py tries others)
         self.line = LINE_PERIOD  # byte of registers 0x88 and 0xC6 for scans (scan_frames() lengthens a strip's frames)
         self.lamp_is_on = False
@@ -1294,6 +1295,8 @@ class PF1800:
         The vendor repeats a busy command without limit; a long lens move (homing from +120 units) keeps it busy for a
         while, so this retries for up to MCU_BUSY_S seconds. Any other reply to cmd 0 is an error: the lens would not move
         and nothing else would show it."""
+        if cmd not in (0, 4):  # the lens and the firmware query leave the film where it is
+            self._rest_holes = None
         t0 = time.time()
         while True:
             reply = self._mcu_code(cmd)
@@ -1731,7 +1734,8 @@ class PF1800:
             time.sleep(warmup)
         lines = [self._read_stationary(n > 0) for n in range(2)]  # the first line after a setup is the vendor's discard
         self.safe_initial_chip()
-        return None if lines[1] is None else whole_holes(line_red(lines[1]))
+        self._rest_holes = None if lines[1] is None else whole_holes(line_red(lines[1]))
+        return self._rest_holes
 
     def _measure(self, last, expect, what):
         """A hole read and the travel since `last` (expected about `expect`); the nominal travel when no hole shows."""
@@ -1753,7 +1757,7 @@ class PF1800:
         Fine units give only a limited travel after the last coarse unit and then stall. Then, when `over_ok` and
         `short_ok` are given (how far the feed may overshoot or fall short before something is lost), one more coarse unit
         is fed if it loses less than stopping short does; otherwise the feed stops where it is."""
-        last = self._hole_read(warmup)
+        last = self._rest_holes or self._hole_read(warmup)  # scans do not move the film, so the read before them still holds
         if self.dry_run:
             self._feed((2, 7))
             self._feed((1,))
