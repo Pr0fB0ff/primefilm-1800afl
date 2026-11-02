@@ -75,8 +75,8 @@ def save(frame: Frame, prefix: Path, colour=False):
 # Open light is read (a seek home, a 64-line scan and the way back out, about 8 s) before the first SAG_EVERY_FROM frames, while
 # the lamp settles, then every `sag_every` frames; the frames between take the trend of the last two readings, held within
 # SAG_EXTRAPOLATE of the last. Simulated on roll38 and roll41 to roll44 (the readings along each roll, every third taken):
-# the estimate is off by 0.25 to 0.5 % on average and 1 to 4 % at most, where the reading itself is steady to 0.1 %.
-SAG_EVERY, SAG_EVERY_FROM, SAG_EXTRAPOLATE = 3, 3, 0.03
+# the estimate is off by 0.25 to 0.7 % on average and 1 to 4 % at most, where the reading itself is steady to 0.1 %.
+SAG_EVERY, SAG_EVERY_FROM, SAG_EXTRAPOLATE = 3, 2, 0.03
 
 @dataclass
 class ScanOptions:
