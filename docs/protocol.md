@@ -407,6 +407,12 @@ To find it, scan 600 lines from step 2000 in 8-bit grey (red at gain 5) and look
 all rows, at least 60 px wide. Pale, even picture beside a gap can look like one in a shorter scan, so use all 600 rows. A gap ending at the gate's
 end may just be running into the gate's mask. See `frame_edge()`.
 
+Long scratches run along the film through its gaps, so a scratched gap is not even over the rows. Where that test finds no edge, look for clear film
+instead: split the rows into 8 bands, take each column's darkest band median, and keep the runs at 0.83 of the film base or more, closing breaks
+up to 20 px wide. A gap is clear over every row, where bright picture is not: real gaps read 0.86 to 0.90 by this measure, and pale picture under 0.8.
+The same runs serve the checks on a frame's own scan. With clear film in view, an even run that does not overlap it is an even part of the picture,
+not a gap. These limits rest on one scratched strip. See `clear_gaps()` and `scratched_edge()`.
+
 Then a whole roll runs as:
 
 1. Align frame 1 from the scan and feed its edge to 45, checking with a short scan (150 lines) after each feed, up to 3 times. Where the check and
@@ -414,7 +420,9 @@ Then a whole roll runs as:
 2. Autofocus on frame 1. Set the gain from the film base in that first scan.
 3. Scan 1800 lines from step 1500.
 4. Check the frame's own scan: where the gap really is over all rows shows a frame too far in or too far on. If so, place it and scan again, once.
-5. Feed about 38 mm less a margin, stopping short if the last scan shows the next frame's edge, and align again.
+5. Where the frame's own left edge shows in its scan, the next edge lies 38 mm on from it: feed that edge to 35 and confirm it with one short scan.
+   Otherwise, or where that scan and the holes disagree by more than 60 px, feed about 38 mm less a margin, stopping short if the last scan shows the
+   next frame's edge, and align again in full. A strip with uneven spacing takes the full alignment more often.
 6. Stop at the end (below).
 
 ### The end of a strip
@@ -438,7 +446,8 @@ None of this is protocol, but a driver will want it. Each is the host's job, sin
 
 - **Flat-field**: open light from the calibration window at step 30 and dark at step 700, 64 lines each, per pixel, at the same settings as the scan.
 - **Response sag along a roll**: open light fell 14 % over 39 frames, caused by scanning and not lamp age, and each frame's clear film tracked it. Read open
-  light before each frame and scale the frame to frame 1. Seek home before each reading: the tracked position drifts over a long run.
+  light before the first two frames and then every third, take the trend for the frames between, and scale each frame to frame 1. Seek home before each
+  reading: the tracked position drifts over a long run.
 - **Falloff along the CCD**: about 0.95 of the middle at a frame's left end and 0.88 at its right.
 
 ## Not known

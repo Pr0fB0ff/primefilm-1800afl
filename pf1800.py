@@ -785,7 +785,7 @@ def plausible_gaps(r, gaps):
 
 
 def clear_gaps(r):
-    """Runs (start, end) of clear film in a negative by the columns' median level, for a scratched film (see CLEAR_SHARE)."""
+    """Runs (start, end) of clear film in a negative by each column's darkest row band, for a scratched film (see CLEAR_SHARE)."""
     import numpy as np
 
     bands = np.array_split(r[:, :GATE_END], CLEAR_BANDS)
@@ -805,7 +805,8 @@ def clear_gaps(r):
 
 
 def scratched_edge(r, at_least=0):
-    """The first frame edge at or right of `at_least` by whole gaps of a scratched film (see CLEAR_SHARE), or None."""
+    """A scratched film's frame edge by its clear gaps (see CLEAR_SHARE), or None: the end of a gap cut by the gate start, the
+    left edge of a frame already in the gate before a whole gap, or the first whole gap's end at or right of `at_least`."""
     for s, e in clear_gaps(r):
         if s == 0 and EDGE_GAP <= e + 1 < WIDE_GAP:  # cut by the gate start: its end is the frame's edge (roll52, 0 to 209)
             return e + 1
@@ -827,7 +828,8 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
     is wider than WIDE_GAP, a thin, uniform part of the next frame then continuing it). A gap running into the gate's end
     gives way to such an inner edge when its darkest row lies more than FALSE_DIP lower than the inner gap's (roll36b and
     roll36c frame 7: pale picture at the gate end, darkest row 0.74 against 0.93, put the frame at -69 instead of feeding the
-    real gap's edge, 207, in). None if there is none."""
+    real gap's edge, 207, in). With clear film in the gate an inner gap must overlap it, and with no edge from the flat runs
+    scratched_edge() has the last word, so None if neither finds one."""
     import numpy as np
 
     level, spread, base = r.mean(0), r.std(0), np.percentile(r, 99.5)
