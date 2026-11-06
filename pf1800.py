@@ -216,6 +216,18 @@ _RESCAN_NOTE = None  # a strip frame scan whose first real gap (over the picture
 LEADER_DARK = 8  # an uncut roll starts with its leader, fogged black when the camera was loaded: its alignment scan read
 # column means of at most 2.7 (99.5th percentile 4) against 77 to 97 for film base (roll36). A gate whose columns are all
 # under LEADER_DARK holds only leader, which the user is to cut off before loading
+# Manual drive (jog(), seek_frames(), lens_to(), preview()): at most JOG_MAX coarse or JOG_FINE_MAX fine units per jog. A
+# seek forward feeds SEEK_MARGIN px a frame short of the pitch, at most SEEK_MARGIN_MOST in all: an overshoot past the gate
+# start loses the frame to the next one's gap, while the alignment still finds a frame fed up to about 2400 px short (pitches
+# scatter by about 20 px, lost coarse units only shorten). A seek back aims the frame SEEK_BACK_AT px into the gate before the
+# coarse unit forward and the alignment, so the back units' scatter (187 to 311 px each) lands inside the gate either way.
+JOG_MAX, JOG_FINE_MAX = 8, 20
+SEEK_MARGIN, SEEK_MARGIN_MOST, SEEK_BACK_AT = 100, 2000, 1000
+LENS_MOST, STRIP_LENS_MOST = 75, 45  # lens_to() limits: autofocus()'s full sweep, and a strip's (strips focus at +0 to +23;
+# dust1's lens stopped answering after +61 until a power cycle)
+FRAME_MIDDLE = FRAME_SCAN[1] + FRAME_SCAN[0] // 2  # carriage steps over the middle of a strip frame: where it focuses
+PREVIEW_LEFT = 63  # frame-scan column of a preview's first sample (gf1's three proofs registered on their frame scans: 62 to
+# 65): the proof keeps the 432 samples before each line's end marker, which start that far in from the gate
 
 
 class ScannerError(Exception):
@@ -969,6 +981,10 @@ class PF1800:
         self.lens_used = False
         self.film = None  # 'strip', 'slide' or 'none' as film_type() last saw it
         self.focus = None  # lens units from home applied before each scan (None: leave the lens where it is)
+        self.placed = None  # CCD pixel where the last frame edge was placed (place_edge(), align_frame()); None when not
+        # known, or the film has moved since other than by jog()
+        self.jogged = 0.0  # film travel jog() measured since then, px forward
+        self.stopped_at_start = False  # the last jog() or seek_frames() back stopped at the strip's start
 
     # ---- session -----------------------------------------------------------------------------------------------------
 
@@ -1375,17 +1391,8 @@ class PF1800:
             if k:
                 self.lens_move(step)
             k += 1
-            self._setup_stationary()
-            lines = [self._read_stationary(n > 0) for n in range(reads)]
-            if any(line is None for line in lines):
-                scores.append(0.0)
-                continue
-            score = 0.0
-            for line in lines:
-                red = line[3 * (CROP + 200) : 3 * (PIXELS - 200) : 3]
-                mean = sum(red) / len(red)
-                score += sum((b - a) ** 2 for a, b in zip(red, red[1:])) / len(red) / max(1.0, mean) ** 2 * 1e4
-            scores.append(score / reads)
+            score = self._focus_score(reads)
+            scores.append(0.0 if score is None else score)
         self.safe_initial_chip()
         best = max(range(len(scores)), key=scores.__getitem__)
         focus = start + best * step
@@ -1402,6 +1409,21 @@ class PF1800:
         self.focus = focus
         self._lens_at = focus
         return focus
+
+    def _focus_score(self, reads=2):
+        """The lateral sharpness of `reads` stationary 8-bit lines of the whole CCD where the carriage stands (red,
+        normalised gradient energy, their mean); None when a line is not read (a dry run). Leaves the chip set up for
+        stationary reads: safe_initial_chip() follows."""
+        self._setup_stationary()
+        lines = [self._read_stationary(n > 0) for n in range(reads)]
+        if any(line is None for line in lines):
+            return None
+        score = 0.0
+        for line in lines:
+            red = line[3 * (CROP + 200) : 3 * (PIXELS - 200) : 3]
+            mean = sum(red) / len(red)
+            score += sum((b - a) ** 2 for a, b in zip(red, red[1:])) / len(red) / max(1.0, mean) ** 2 * 1e4
+        return score / reads
 
     def _setup_stationary(self):
         """The verified stationary calibration-style read (variant A, 8-bit, whole CCD line, motor disabled, count 3)."""
@@ -1522,6 +1544,7 @@ class PF1800:
         self._setup_scan(lines, gains, offsets, depth, grey, channel, step)
         stream = bytearray()
         sizes = 0
+        t0 = time.time()
         while len(stream) < lines * line_bytes:
             chunk = self.tr.stream_chunk(line_bytes if step > 1 else CHUNK)  # the vendor reads one line per transfer
             if chunk is None:
@@ -1543,7 +1566,7 @@ class PF1800:
                 self.log(f"byte slip at line {line} repaired (stream re-split {d:+d} bytes on)")
         else:
             got = [bytes(stream[i * line_bytes : (i + 1) * line_bytes]) for i in range(lines)]
-        self.log(f"{lines} lines in {sizes} transfers")
+        self.log(f"{lines} lines in {sizes} transfers, {time.time() - t0:.1f} s")
         return Frame(got, depth, (gains, offsets), 1 if grey else 3, step)
 
     def calibrate(self, depth=16, gains=None, offsets=None, warmup=10.0, grey=False):
@@ -1757,6 +1780,7 @@ class PF1800:
         Fine units stall with the holes in one band of the pitch, and only a coarse unit is sure to pass it. Then, when
         `over_ok` and `short_ok` are given (how far the feed may overshoot or fall short before something is lost), one more
         coarse unit is fed if it loses less than stopping short does; otherwise the feed stops where it is."""
+        self.placed = None  # the film moves: the next place_edge() or alignment says where the edge is
         last = self._rest_holes or self._hole_read(warmup)  # scans do not move the film, so the read before them still holds
         if self.dry_run:
             self._feed((2, 7))
@@ -1826,6 +1850,7 @@ class PF1800:
             raise EndOfFilm("no frame edge in the gate")
         if -OVER_OK <= edge < 0:
             self.log(f"frame edge found at {edge}: the frame is already in the gate, its first {-edge} px are lost")
+            self.placed, self.jogged = edge, 0.0
             return edge
         at = self.place_edge(edge, edge_at)
         self.log(f"frame edge found at {edge}, now at {'?' if at is None else at}")
@@ -1858,6 +1883,7 @@ class PF1800:
                 self.log(f"check scan ({seen}) and hole reads ({holes}) disagree; going by the holes")
                 seen = None
             at = seen if seen is not None else (None if moved is None else holes)
+        self.placed, self.jogged = at, 0.0
         return at
 
     def _back_off(self, edge):
@@ -1964,6 +1990,7 @@ class PF1800:
         """The vendor's eject (opcode 8): bursts of 8 coarse units forward while page B bit 6 sees film, then 8 more; the
         strip leaves through the exit slot. The carriage goes home first, as the vendor does. Returns the film sensors
         afterwards."""
+        self.placed = None
         if self.position is not None:
             self.safe_initial_chip()
             self.seek_home()
@@ -1994,6 +2021,7 @@ class PF1800:
         entrance (80 units). Refuses with no film on page B bits 7, 6 and 0; stops with an error if bit 6 sees no
         film within REWIND_FIND units, if the entrance sensor (bit 7) clears while going back, or after `max_units`.
         Returns the number of units fed back; 0 in a dry run."""
+        self.placed = None
         sensors = self.film_sensors()
         if sensors is None:
             return 0
@@ -2029,3 +2057,180 @@ class PF1800:
             elif entered:
                 raise ScannerError(f"rewind: the entrance sensor cleared after {n} units back before bit 6 did; stopped")
         raise ScannerError(f"rewind: page B bit 6 did not clear within {max_units} units back; stopped")
+
+    # ---- manual drive ---------------------------------------------------------------------------------------------------
+    # For a caller that places the film by hand: look at the gate, move the film a unit or a number of frames at a time, set
+    # the lens. Scans to keep go through pf1800_scan.RollSession, so that they share a roll's levels.
+
+    def preview(self):
+        """A quick look at the whole gate: the 300 dpi proof (proof_frame(): 8-bit grey, every 6th pixel and motor step)
+        over the strip frame scan's steps, at PROOF_GAIN and with the lens where it is; no lamp settle and no level
+        correction. Sample k of a line is column preview_column(k) of a frame scan, line r lies at about preview_step(r)
+        carriage steps. The 432 samples miss the gate's first PREVIEW_LEFT columns and its last 30, so a frame edge at
+        EDGE_AT is just out of view. About one line in ten sits 4 to 9 samples early (ps1): good enough to see where the
+        film lies, not to measure its edges to the pixel. Logs its time; an empty Frame in a dry run."""
+        t0 = time.time()
+        frame = self.proof_frame(FRAME_SCAN[1])
+        if not self.dry_run:
+            self.log(f"preview in {time.time() - t0:.1f} s")
+        return frame
+
+    @staticmethod
+    def preview_step(row):
+        """Carriage steps past the reference edge of line `row` of a preview() (the line lands up to about 80 steps later:
+        gf1's proofs against their frame scans, 30 to 80, as a new reference repeats only to about 16 steps)."""
+        return FRAME_SCAN[1] + PROOF_STEP * row
+
+    @staticmethod
+    def preview_column(k):
+        """The column of a strip frame scan (CCD pixels from the gate start, as frame_edge() counts them) under sample `k`
+        of a preview line."""
+        return PROOF_STEP * k + PREVIEW_LEFT
+
+    def _back_stop(self):
+        """Why a unit back must not be fed now, or None: no film on page B bits 7, 6 and 0, or the strip at its start (page
+        B bit 6 clear with film at the entrance, bit 7, as rewind() tests it: a strip at frame 1 fed further back was pushed
+        out of the entrance). A strip stopped this way lies a few units in from where the auto-load holds it; rewind() goes
+        the rest. None in a dry run."""
+        sensors = self.film_sensors()
+        if sensors is None:
+            return None
+        b = sensors[1]
+        if not b & 0xC1:
+            return "no film on page B bits 7, 6 and 0"
+        if b & 0x80 and not b & 0x40:
+            return "the strip is at its start (page B bit 6 clear, bit 7 set)"
+        return None
+
+    def jog(self, units, fine=False):
+        """Move a caught strip by `units` feed units: forward (into the scanner; the picture moves toward CCD pixel 0) when
+        positive, back when negative; coarse units (command 2 + 7 forward, 6 + 7 back), or with `fine` fine units (1
+        forward, 5 back). At most JOG_MAX coarse or JOG_FINE_MAX fine units. Every unit back is checked first (_back_stop())
+        and the jog stops at the strip's start (`stopped_at_start`). Returns the travel the hole reads measured, px forward
+        (negative back; the nominal travel where no hole shows), which is added to `jogged`; None in a dry run. EndOfFilm
+        when the strip's tail passes the inner sensor going forward.
+
+        Fine units stall where a perforation reaches one band of the pitch, about 110 px wide, and move little after a
+        reversal until a coarse unit forward; the measure shows it (a stall reads near 0). A hole read cannot see a lost
+        coarse unit (a unit is close to a pitch); a preview can."""
+        if not units:
+            return 0.0
+        forward, n = units > 0, abs(units)
+        most = JOG_FINE_MAX if fine else JOG_MAX
+        if n > most:
+            raise ScannerError(f"a jog moves at most {most} {'fine' if fine else 'coarse'} units")
+        cmds = ((1,) if forward else (5,)) if fine else ((2, 7) if forward else (6, 7))
+        per = FINE_PX if fine else COARSE_PX if forward else BACK_PX
+        group = FINE_MAX if fine else 2 if forward else 1  # units per hole read, which is exact only modulo the pitch
+        name = f"{'fine' if fine else 'coarse'} unit(s) {'forward' if forward else 'back'}"
+        self.stopped_at_start = False
+        last = self._rest_holes or self._hole_read()
+        moved, done, stop = 0.0, 0, None
+        while done < n and stop is None:
+            k = 0
+            while k < min(group, n - done):
+                if not forward:
+                    stop = self._back_stop()
+                    if stop:
+                        break
+                try:
+                    self._feed(cmds)
+                except EndOfFilm:
+                    if forward:
+                        self.placed = None
+                        raise
+                    # going back from the tail (page B bits 7 and 6 clear): the unit was fed and brings it back over bit 6
+                k += 1
+            if k:
+                last, d = self._measure(last, (-k if forward else k) * per, f"{k} {name}")
+                moved -= d
+                done += k
+        if stop:
+            self.log(f"jog: {stop}; {done} of {n} units back fed")
+            self.stopped_at_start = True
+        if self.dry_run:
+            return None
+        self.jogged += moved
+        return moved
+
+    def seek_frames(self, n, pitch_mm=38.0):
+        """Feed a caught strip `n` frames on, or back when negative, and align the frame there (align_frame(at_least=0)); n
+        0 aligns the frame the gate holds, backing it in first when jog() moved its edge out of the gate. Counted from the
+        frame edge placed last (`placed`), less what jog() moved since; with none placed (a fresh session, or the film moved
+        otherwise) the frame in the gate is aligned first (align_frame()) and the count starts there.
+
+        Forward feeds coarse units only, SEEK_MARGIN a frame short of the pitch, and leaves the fine placing to the
+        alignment. Back feeds coarse units until that frame lies about SEEK_BACK_AT px into the gate, stopping at the strip's
+        start (`stopped_at_start`), then one coarse unit forward, which takes up the reversal slack and lets fine units move
+        again, then the alignment. The count is by hole reads, which cannot see a lost coarse unit, and by the nominal
+        pitch, so a seek can land a frame off: look at a preview. Returns the edge found, as align_frame() does (None in a
+        dry run); EndOfFilm as align_frame() and the feed."""
+        self.stopped_at_start = False
+        if self.placed is None and not self.dry_run:
+            edge = self.align_frame()
+            if not n:
+                return edge
+        target = (EDGE_AT if self.placed is None else self.placed) - self.jogged + n * pitch_mm * PX_PER_MM  # its edge now
+        if target >= 0:
+            px = target - EDGE_AT - min(SEEK_MARGIN * max(n, 1), SEEK_MARGIN_MOST)
+            moved = 0.0
+            while px - moved > COARSE_LEFT:
+                chunk = min(px - moved, 8 * COARSE_PX)  # feed_forward() stops at 12 coarse units
+                got = self.feed_forward(chunk, tolerance=COARSE_LEFT)  # coarse units only
+                if got is None:  # a dry run
+                    break
+                if got < COARSE_PX / 2:
+                    raise ScannerError(f"seek: the strip did not move ({got:.0f} of {chunk:.0f} px)")
+                moved += got
+                self.log(f"seek: fed {moved:.0f} of {px:.0f} px")
+        else:
+            self._seek_back(SEEK_BACK_AT - target)
+        return self.align_frame(at_least=0)
+
+    def _seek_back(self, px):
+        """Coarse units back until the film has gone `px` back (to within half a unit), each checked by _back_stop() first
+        and measured on the holes, then one coarse unit forward (the reversal slack, and the fine drive re-engaged, as
+        _back_off() does). At most REWIND_MAX units: longer trips back are not tested on the unit."""
+        units = int(round(px / BACK_PX))
+        if units > REWIND_MAX:
+            raise ScannerError(f"seek: that is about {units} coarse units back; at most {REWIND_MAX} at once")
+        self.placed = None
+        last = self._rest_holes or self._hole_read()
+        back, fed = 0.0, 0
+        while back < px - BACK_PX / 2 and fed < REWIND_MAX:
+            stop = self._back_stop()
+            if stop:
+                self.log(f"seek: {stop}; stopped {px - back:.0f} px short")
+                self.stopped_at_start = True
+                break
+            try:
+                self._feed((6, 7))
+            except EndOfFilm:
+                pass  # going back from the tail: the unit was fed (see jog())
+            fed += 1
+            last, d = self._measure(last, BACK_PX, "one coarse unit back")
+            back += d
+            if self.dry_run:
+                break
+        self._feed((2, 7))
+        self._measure(last, -AFTER_BACK_PX, "one coarse unit forward after going back")
+
+    def lens_to(self, units, position=FRAME_MIDDLE, most=LENS_MOST):
+        """Set the lens `units` from home (lens home, then the moves) and read the focus score there (_focus_score()), the
+        carriage at `position` steps, which must hold picture detail. The lens moves as autofocus() moves it, outside a scan
+        (dust1: after lens moves made inside scans the lens stopped following until a power cycle, cause unknown), and the
+        score shows whether it arrived: one that reads about the same at every setting is stuck. Sets `focus`, so scans leave the
+        lens there. `most`: LENS_MOST, or STRIP_LENS_MOST for a strip. Returns the score; None in a dry run."""
+        if not 0 <= units <= most:
+            raise ScannerError(f"lens +{units} is outside 0 to +{most}")
+        if self.position is None:
+            self.reference()
+        self.go_to(position)
+        self.lens_home()
+        self.lens_move(units)
+        self.focus = self._lens_at = units
+        score = self._focus_score()
+        self.safe_initial_chip()
+        if score is not None:
+            self.log(f"lens +{units}: focus score {score:.1f}")
+        return score

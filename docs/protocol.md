@@ -256,6 +256,11 @@ the rest of the stream at the offset between -3 and +3 bytes that makes the line
 extra at its start, and ends with a marker of 11 zero samples, so take the samples before each marker (`sync_proof_lines()`).
 16-bit mono at 300 dpi gave noise.
 
+Kept that way (432 samples, mirrored as a 1800 dpi line is), sample k lies over column 6k + 63 of a 1800 dpi strip frame scan
+(three frames registered: 62 to 65), so a proof misses the first 63 and the last 30 columns of the gate. About one line in ten
+sits 4 to 9 samples early; the cause is not known. That is fine for seeing where the film lies, which is what the driver's
+`preview()` uses it for, but not for measuring edges.
+
 ### Line period
 
 The byte in `88` and `C6` sets the line time, which is proportional to 256 minus the byte, and with one motor step per line it
@@ -444,6 +449,25 @@ dragging on the other.
 **Rewind** to scan again: coarse units back (6 then 7) one at a time. Only start from a sensor state that says where the strip is: pressing on past
 the start pushes the strip out of the entrance. Bit 6 clears about 760 px in from the auto-load position, so feed 3 more units back after it
 clears. With bit 6 clear and bit 7 set, the strip is at its start already, so nothing should move.
+
+### Moving by hand
+
+`jog()`, `seek_frames()` and `lens_to()` let a caller place the film itself; the rules are the ones above.
+
+- **Measure in short legs.** A hole read is exact only modulo the pitch, so read after every 2 coarse units forward, every coarse unit
+  back and every 7 fine units, as the closed-loop feed does. A lost coarse unit still reads as a normal one; look at a preview.
+- **Check before every unit back.** Stop when page B bit 6 is clear and bit 7 set (the strip is at its start), or when bits 7, 6 and 0
+  see no film. Going back from the tail, with bits 7 and 6 clear and bit 0 set, is fine: the tail comes back over bit 6.
+- **Fine units are weak.** They stall where a perforation reaches one band of the pitch, about 110 px wide and placed differently from
+  run to run, and hardly move after a reversal until a coarse unit forward. A coarse unit gets past both.
+- **Seek by frames with coarse units, then align.** Forward, feed about 100 px a frame short of the 38 mm pitch: an overshoot past the
+  gate start takes the next frame's gap, while a shortfall of up to about 2400 px is still found by the alignment. Back, go about 1000
+  px past the frame's place, then one coarse unit forward to take up the reversal slack, then align. On a simulated strip with the
+  measured unit scatter and stalls, every such seek of -3 to +5 frames landed on the right frame. Trips of more than 64 units back
+  have not been tried on the unit.
+- **Set the lens the way autofocus does**: lens home, the moves, then stationary reads for a score. Once, after lens moves made inside
+  scans, the lens stopped following any command until a power cycle; the cause is not known. A score that stays the same at every
+  setting shows a stuck lens.
 
 ## Picture corrections
 
