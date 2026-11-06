@@ -261,6 +261,13 @@ Kept that way (432 samples, mirrored as a 1800 dpi line is), sample k lies over 
 sits 4 to 9 samples early; the cause is not known. That is fine for seeing where the film lies, which is what the driver's
 `preview()` uses it for, but not for measuring edges.
 
+**Dense film breaks the line split.** The 11 dark samples ending each line move with the front-end offset and gain like the
+picture does (at the red offset 160 or 120 they read about 25, and no line end is found at all), so they look like the CCD's
+dark reference pixels rather than a marker the controller adds. Where the film is dense enough to read 0 to 2 as well (man1,
+lev1, lev2: median 1 at gain 2), the split takes picture for line ends and the proof comes out as noise and repeated lines.
+Read one per transfer, the stream comes in 448-byte pieces that do not follow the lines: a fixed 448-sample split shears by
+about 4.5 samples a line, so a line is about 452 samples. A robust split, and so a preview of dense film, is still to be found.
+
 ### Line period
 
 The byte in `88` and `C6` sets the line time, which is proportional to 256 minus the byte, and with one motor step per line it
@@ -456,15 +463,21 @@ clears. With bit 6 clear and bit 7 set, the strip is at its start already, so no
 
 - **Measure in short legs.** A hole read is exact only modulo the pitch, so read after every 2 coarse units forward, every coarse unit
   back and every 7 fine units, as the closed-loop feed does. A lost coarse unit still reads as a normal one; look at a preview.
-- **Check before every unit back.** Stop when page B bit 6 is clear and bit 7 set (the strip is at its start), or when bits 7, 6 and 0
-  see no film. Going back from the tail, with bits 7 and 6 clear and bit 0 set, is fine: the tail comes back over bit 6.
+- **Check before every unit back.** Never with no film on bits 7, 6 and 0. Near the start (bit 6 clear, bit 7 set) go back no further
+  than `rewind()` does: 3 coarse units after bit 6 clears, counted in units, not pixels, as their travel varies. Units fed forward
+  while bit 6 is clear can be taken back. Going back from the tail, with bits 7 and 6 clear and bit 0 set, is fine: the tail comes
+  back over bit 6. The automatic back-off follows the same rule. On the unit (start1) the last units back before that point read a
+  single hole each, 316 to 333 px, which may be units that did not move (a stall folds to about 341).
 - **Fine units are weak.** They stall where a perforation reaches one band of the pitch, about 110 px wide and placed differently from
   run to run, and hardly move after a reversal until a coarse unit forward. A coarse unit gets past both.
 - **Seek by frames with coarse units, then align.** Forward, feed about 100 px a frame short of the 38 mm pitch: an overshoot past the
   gate start takes the next frame's gap, while a shortfall of up to about 2400 px is still found by the alignment. Back, go about 1000
-  px past the frame's place, then one coarse unit forward to take up the reversal slack, then align. On a simulated strip with the
-  measured unit scatter and stalls, every such seek of -3 to +5 frames landed on the right frame. Trips of more than 64 units back
-  have not been tried on the unit.
+  px past the frame's place, then one coarse unit forward to take up the reversal slack, then align; a seek that reaches the start
+  leaves that unit out, since it would take frame 1 out of the gate. On a simulated strip with the measured unit scatter and stalls,
+  every such seek of -5 to +5 frames landed on the right frame, and none went back further than `rewind()`. On the unit a seek forward
+  and one back to the start landed on the right frames (man1, start1), but at the start the frame was left 0 to 70 px past the gate
+  start: fine units do not move after the reversal, and the back-off that would correct an overshoot is not allowed there. Trips of
+  more than 64 units back have not been tried on the unit.
 - **Set the lens the way autofocus does**: lens home, the moves, then stationary reads for a score. Once, after lens moves made inside
   scans, the lens stopped following any command until a power cycle; the cause is not known. A score that stays the same at every
   setting shows a stuck lens.

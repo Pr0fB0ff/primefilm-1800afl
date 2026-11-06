@@ -985,6 +985,9 @@ class PF1800:
         # known, or the film has moved since other than by jog()
         self.jogged = 0.0  # film travel jog() measured since then, px forward
         self.stopped_at_start = False  # the last jog() or seek_frames() back stopped at the strip's start
+        self.start_lead = 0.0  # coarse units the strip lies in from where the auto-load holds it, while page B bit 6 is
+        # clear (see _back_stop()); 0 when not known, which allows nothing back there
+        self._b6 = None  # page B bit 6 at the last read by _start_state(), None before one
 
     # ---- session -----------------------------------------------------------------------------------------------------
 
@@ -1889,15 +1892,25 @@ class PF1800:
     def _back_off(self, edge):
         """Bring a frame edge at CCD pixel `edge`, before the gate start, back into the gate: coarse units back until it
         is BACK_TO in (at most BACK_MAX), then one coarse unit forward, which takes up the reversal slack and lets fine units
-        move again. Every unit is measured on the holes. Returns the edge's new position."""
+        move again. Every unit is measured on the holes. Units back stop at the strip's start (_back_stop()), and with none
+        fed nothing moves: the frame is then left as it lies. Returns the edge's new position."""
         self.log(f"frame edge at {edge:.0f}, fed too far: backing it off")
         last = self._hole_read()
+        fed = 0
         for _ in range(BACK_MAX):
             if edge >= BACK_TO:
                 break
+            stop = self._back_stop()
+            if stop:
+                self.log(f"back-off: {stop}; {fed} unit(s) fed back")
+                break
             self._feed((6, 7))
+            fed += 1
             last, d = self._measure(last, BACK_PX, "one coarse unit back")
+            self._note_start(-1)
             edge += d
+        if not fed:
+            return edge
         self._feed((2, 7))
         last, d = self._measure(last, -AFTER_BACK_PX, "one coarse unit forward after the back-off")
         edge += d
@@ -2068,7 +2081,10 @@ class PF1800:
         correction. Sample k of a line is column preview_column(k) of a frame scan, line r lies at about preview_step(r)
         carriage steps. The 432 samples miss the gate's first PREVIEW_LEFT columns and its last 30, so a frame edge at
         EDGE_AT is just out of view. About one line in ten sits 4 to 9 samples early (ps1): good enough to see where the
-        film lies, not to measure its edges to the pixel. Logs its time; an empty Frame in a dry run."""
+        film lies, not to measure its edges to the pixel. On dense film it fails: picture reading 0 to 2 is taken for the
+        dark samples that end each line (sync_proof_lines()), and the preview comes out as noise and repeated lines (man1;
+        lev1 and lev2 found no offset or gain that keeps the split right). Logs its time (man1: 7.4 to 8.8 s, of which the
+        stream takes 3); an empty Frame in a dry run."""
         t0 = time.time()
         frame = self.proof_frame(FRAME_SCAN[1])
         if not self.dry_run:
@@ -2087,18 +2103,39 @@ class PF1800:
         of a preview line."""
         return PROOF_STEP * k + PREVIEW_LEFT
 
-    def _back_stop(self):
-        """Why a unit back must not be fed now, or None: no film on page B bits 7, 6 and 0, or the strip at its start (page
-        B bit 6 clear with film at the entrance, bit 7, as rewind() tests it: a strip at frame 1 fed further back was pushed
-        out of the entrance). A strip stopped this way lies a few units in from where the auto-load holds it; rewind() goes
-        the rest. None in a dry run."""
+    def _start_state(self):
+        """Read page B (None in a dry run) and keep `start_lead`: going back, page B bit 6 clears REWIND_PAST coarse units in
+        from where the auto-load holds the strip (rewind(); counted in units, whose travel back varies from about 190 to
+        330 px), so that is what start_lead is set to when bit 6 is seen to clear."""
         sensors = self.film_sensors()
         if sensors is None:
             return None
-        b = sensors[1]
+        b6 = bool(sensors[1] & 0x40)
+        if self._b6 and not b6:
+            self.start_lead = float(REWIND_PAST)
+        self._b6 = b6
+        return sensors[1]
+
+    def _note_start(self, units):
+        """After a move of `units` coarse units forward (negative back; fine units as their measured travel over COARSE_PX):
+        while page B bit 6 was clear before and after it, the strip's distance from the start changed by that much."""
+        was = self._b6
+        self._start_state()
+        if was is False and self._b6 is False:
+            self.start_lead = max(0.0, self.start_lead + units)
+
+    def _back_stop(self, units=1.0):
+        """Why `units` coarse units back (a fine unit is FINE_PX / COARSE_PX of one) must not be fed now, or None: no film on
+        page B bits 7, 6 and 0, or the strip at its start. Near the start (page B bit 6 clear, bit 7 set) a unit back goes
+        only while `start_lead` holds most of it: a strip fed back past where the auto-load holds it was pushed out of the
+        entrance. With no lead known (a session opened there) that is nothing; going back, the lead is set as bit 6 clears,
+        and units forward while it is clear add to it, so a nudge forward can be undone. None in a dry run."""
+        b = self._start_state()
+        if b is None:
+            return None
         if not b & 0xC1:
             return "no film on page B bits 7, 6 and 0"
-        if b & 0x80 and not b & 0x40:
+        if b & 0x80 and not b & 0x40 and self.start_lead < 0.75 * units:
             return "the strip is at its start (page B bit 6 clear, bit 7 set)"
         return None
 
@@ -2124,13 +2161,14 @@ class PF1800:
         group = FINE_MAX if fine else 2 if forward else 1  # units per hole read, which is exact only modulo the pitch
         name = f"{'fine' if fine else 'coarse'} unit(s) {'forward' if forward else 'back'}"
         self.stopped_at_start = False
+        self._start_state()  # bit 6 before the first unit, for start_lead
         last = self._rest_holes or self._hole_read()
         moved, done, stop = 0.0, 0, None
         while done < n and stop is None:
             k = 0
             while k < min(group, n - done):
                 if not forward:
-                    stop = self._back_stop()
+                    stop = self._back_stop(FINE_PX / COARSE_PX if fine else 1.0)
                     if stop:
                         break
                 try:
@@ -2143,6 +2181,7 @@ class PF1800:
                 k += 1
             if k:
                 last, d = self._measure(last, (-k if forward else k) * per, f"{k} {name}")
+                self._note_start(-d / COARSE_PX if fine else k if forward else -k)
                 moved -= d
                 done += k
         if stop:
@@ -2185,12 +2224,14 @@ class PF1800:
                 self.log(f"seek: fed {moved:.0f} of {px:.0f} px")
         else:
             self._seek_back(SEEK_BACK_AT - target)
-        return self.align_frame(at_least=0)
+        return self.align_frame(at_least=0)  # at the start (stopped_at_start) the gate holds frame 1, as after rewind()
 
     def _seek_back(self, px):
         """Coarse units back until the film has gone `px` back (to within half a unit), each checked by _back_stop() first
         and measured on the holes, then one coarse unit forward (the reversal slack, and the fine drive re-engaged, as
-        _back_off() does). At most REWIND_MAX units: longer trips back are not tested on the unit."""
+        _back_off() does). At the strip's start that unit is left out: it would take frame 1 out of the gate, which the
+        auto-load position holds it in (rewind() then scan_frames() aligns it there, rw2). At most REWIND_MAX units: longer
+        trips back are not tested on the unit."""
         units = int(round(px / BACK_PX))
         if units > REWIND_MAX:
             raise ScannerError(f"seek: that is about {units} coarse units back; at most {REWIND_MAX} at once")
@@ -2209,11 +2250,15 @@ class PF1800:
                 pass  # going back from the tail: the unit was fed (see jog())
             fed += 1
             last, d = self._measure(last, BACK_PX, "one coarse unit back")
+            self._note_start(-1)
             back += d
             if self.dry_run:
                 break
+        if self.stopped_at_start:
+            return
         self._feed((2, 7))
         self._measure(last, -AFTER_BACK_PX, "one coarse unit forward after going back")
+        self._note_start(1)
 
     def lens_to(self, units, position=FRAME_MIDDLE, most=LENS_MOST):
         """Set the lens `units` from home (lens home, then the moves) and read the focus score there (_focus_score()), the
