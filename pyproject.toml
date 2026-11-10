@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "primefilm-1800afl"
-version = "0.1.0"
+version = "0.2.0"
 description = "Userspace driver for the Pacific Image PrimeFilm 1800 AFL film scanner"
 readme = "README.md"
 requires-python = ">=3.10"
