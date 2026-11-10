@@ -226,8 +226,6 @@ SEEK_MARGIN, SEEK_MARGIN_MOST, SEEK_BACK_AT = 100, 2000, 1000
 LENS_MOST, STRIP_LENS_MOST = 75, 45  # lens_to() limits: autofocus()'s full sweep, and a strip's (strips focus at +0 to +23;
 # dust1's lens stopped answering after +61 until a power cycle)
 FRAME_MIDDLE = FRAME_SCAN[1] + FRAME_SCAN[0] // 2  # carriage steps over the middle of a strip frame: where it focuses
-PREVIEW_LEFT = 63  # frame-scan column of a preview's first sample (gf1's three proofs registered on their frame scans: 62 to
-# 65): the proof keeps the 432 samples before each line's end marker, which start that far in from the gate
 
 
 class ScannerError(Exception):
@@ -2075,33 +2073,25 @@ class PF1800:
     # For a caller that places the film by hand: look at the gate, move the film a unit or a number of frames at a time, set
     # the lens. Scans to keep go through pf1800_scan.RollSession, so that they share a roll's levels.
 
-    def preview(self):
-        """A quick look at the whole gate: the 300 dpi proof (proof_frame(): 8-bit grey, every 6th pixel and motor step)
-        over the strip frame scan's steps, at PROOF_GAIN and with the lens where it is; no lamp settle and no level
-        correction. Sample k of a line is column preview_column(k) of a frame scan, line r lies at about preview_step(r)
-        carriage steps. The 432 samples miss the gate's first PREVIEW_LEFT columns and its last 30, so a frame edge at
-        EDGE_AT is just out of view. About one line in ten sits 4 to 9 samples early (ps1): good enough to see where the
-        film lies, not to measure its edges to the pixel. On dense film it fails: picture reading 0 to 2 is taken for the
-        dark samples that end each line (sync_proof_lines()), and the preview comes out as noise and repeated lines (man1;
-        lev1 and lev2 found no offset or gain that keeps the split right). Logs its time (man1: 7.4 to 8.8 s, of which the
-        stream takes 3); an empty Frame in a dry run."""
+    def preview(self, lines=ALIGN_SCAN[0]):
+        """A quick look at the gate: an alignment scan (8-bit grey of ALIGN_CHANNEL at ALIGN_GAIN, at 1800 dpi, 148 lines a
+        second) of `lines` lines centred on the frame, with the lens where it is; no lamp settle and no level correction.
+        Its columns are those of a frame scan (CCD pixels from the gate start, as frame_edge() counts them), so the whole
+        gate shows; line r lies at preview_step(r) carriage steps. The default 600 lines are the middle third of the frame
+        (about 4 s of stream); FRAME_SCAN[0] lines show it whole (about 12 s). The 300 dpi proof was tried first and
+        cannot be read on dense film (man1, lev2: its line split takes dark picture for line ends), where this scan reads
+        well. Logs its time; an empty Frame in a dry run."""
+        self.preview_at = max(FRAME_SCAN[1], FRAME_MIDDLE - lines // 2)
         t0 = time.time()
-        frame = self.proof_frame(FRAME_SCAN[1])
+        frame = self.scan(lines, self.preview_at, (ALIGN_GAIN,) * 3, warmup=0.0, depth=8, grey=True, channel=ALIGN_CHANNEL)
         if not self.dry_run:
             self.log(f"preview in {time.time() - t0:.1f} s")
         return frame
 
-    @staticmethod
-    def preview_step(row):
-        """Carriage steps past the reference edge of line `row` of a preview() (the line lands up to about 80 steps later:
-        gf1's proofs against their frame scans, 30 to 80, as a new reference repeats only to about 16 steps)."""
-        return FRAME_SCAN[1] + PROOF_STEP * row
-
-    @staticmethod
-    def preview_column(k):
-        """The column of a strip frame scan (CCD pixels from the gate start, as frame_edge() counts them) under sample `k`
-        of a preview line."""
-        return PROOF_STEP * k + PREVIEW_LEFT
+    def preview_step(self, row):
+        """Carriage steps past the reference edge of line `row` of the last preview() (to about 16 steps: where a new
+        reference starts repeats only that well)."""
+        return getattr(self, "preview_at", FRAME_SCAN[1]) + row
 
     def _start_state(self):
         """Read page B (None in a dry run) and keep `start_lead`: going back, page B bit 6 clears REWIND_PAST coarse units in

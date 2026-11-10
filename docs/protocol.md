@@ -258,8 +258,8 @@ extra at its start, and ends with a marker of 11 zero samples, so take the sampl
 
 Kept that way (432 samples, mirrored as a 1800 dpi line is), sample k lies over column 6k + 63 of a 1800 dpi strip frame scan
 (three frames registered: 62 to 65), so a proof misses the first 63 and the last 30 columns of the gate. About one line in ten
-sits 4 to 9 samples early; the cause is not known. That is fine for seeing where the film lies, which is what the driver's
-`preview()` uses it for, but not for measuring edges.
+sits 4 to 9 samples early; the cause is not known. That is fine for seeing where the film lies, but not for measuring
+edges, and on dense film it fails (below), so the driver's `preview()` uses an alignment scan instead.
 
 **Dense film breaks the line split.** The 11 dark samples ending each line move with the front-end offset and gain like the
 picture does (at the red offset 160 or 120 they read about 25, and no line end is found at all), so they look like the CCD's
