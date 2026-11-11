@@ -229,6 +229,8 @@ SEEK_MARGIN, SEEK_MARGIN_MOST, SEEK_BACK_AT = 100, 2000, 1000
 LENS_MOST, STRIP_LENS_MOST = 75, 45  # lens_to() limits: autofocus()'s full sweep, and a strip's (strips focus at +0 to +23;
 # dust1's lens stopped answering after +61 until a power cycle)
 FRAME_MIDDLE = FRAME_SCAN[1] + FRAME_SCAN[0] // 2  # carriage steps over the middle of a strip frame: where it focuses
+QUICK_PREVIEW = (300, FRAME_SCAN[1] + FRAME_ROWS[0] + 150)  # preview() lines and centre for a look at where the film lies:
+# the picture's first 300 rows, the part of a frame nearest STRIP_PARK, so the carriage's trips there and back are shortest
 
 
 class ScannerError(Exception):
@@ -841,10 +843,11 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
     is wider than WIDE_GAP, a thin, uniform part of the next frame then continuing it). A run wider than a gap that holds
     a frame end (frame_ends(), at least LINE_SURE) is placed by that end instead (_edge_after()): on a strip of flash and
     night pictures whose clear backgrounds ran into the gaps (edge1) the guesses were up to 600 px out; on 542 older
-    alignment scans it changes 13, most to a visible gap's true end. A gap running into the gate's end gives way to such an inner edge when its darkest row lies more than FALSE_DIP lower than the inner gap's (roll36b and
-    roll36c frame 7: pale picture at the gate end, darkest row 0.74 against 0.93, put the frame at -69 instead of feeding the
-    real gap's edge, 207, in). With clear film in the gate an inner gap must overlap it, and with no edge from the flat runs
-    scratched_edge() has the last word, so None if neither finds one."""
+    alignment scans it changes 13, most to a visible gap's true end. A gap running into the gate's end gives way to such an
+    inner edge when its darkest row lies more than FALSE_DIP lower than the inner gap's (roll36b and roll36c frame 7: pale
+    picture at the gate end, darkest row 0.74 against 0.93, put the frame at -69 instead of feeding the real gap's edge,
+    207, in). With clear film in the gate an inner gap must overlap it, and with no edge from the flat runs scratched_edge()
+    has the last word, so None if neither finds one."""
     import numpy as np
 
     level, spread, base = r.mean(0), r.std(0), np.percentile(r, 99.5)
@@ -1085,6 +1088,7 @@ class PF1800:
         # known, or the film has moved since other than by jog()
         self.jogged = 0.0  # film travel jog() measured since then, px forward
         self.stopped_at_start = False  # the last jog() or seek_frames() back stopped at the strip's start
+        self._feed_dir = 0  # the way the last feed unit went: 1 forward, -1 back, 0 not known
         self.start_lead = 0.0  # coarse units the strip lies in from where the auto-load holds it, while page B bit 6 is
         # clear (see _back_stop()); 0 when not known, which allows nothing back there
         self._b6 = None  # page B bit 6 at the last read by _start_state(), None before one
@@ -1596,8 +1600,9 @@ class PF1800:
     def _setup_scan(self, lines, gains, offsets, depth=8, grey=False, channel=GREY_CHANNEL, step=1):
         self.tr.stream_started = False
         self.safe_initial_chip()
+        was_on = self.lamp_is_on
         self.lamp(True)
-        if not self.dry_run:
+        if not self.dry_run and not was_on:  # a lamp already lit needs no time to come on (half a second a preview)
             time.sleep(0.5)
         self._need(0x02, "the lamp setup")
         self.set_gpio()  # the order of the vendor's scan setup, as verified by the full scans
@@ -1841,6 +1846,7 @@ class PF1800:
         self.go_to(STRIP_PARK)
         for cmd in cmds:
             self.mcu_command(cmd)
+        self._feed_dir = -1 if cmds[0] in (5, 6) else 1
         sensors = self.film_sensors()
         if sensors is None:
             return
@@ -2164,6 +2170,7 @@ class PF1800:
                     self.mcu_command(6)
                     self.mcu_command(7)
                 self.log(f"rewind: page B bit 6 cleared after {n} coarse units back, then {REWIND_PAST} more: at the start")
+                self._feed_dir = -1
                 return n + REWIND_PAST
             if b & 0x80:
                 entered = True
@@ -2175,15 +2182,16 @@ class PF1800:
     # For a caller that places the film by hand: look at the gate, move the film a unit or a number of frames at a time, set
     # the lens. Scans to keep go through pf1800_scan.RollSession, so that they share a roll's levels.
 
-    def preview(self, lines=ALIGN_SCAN[0]):
+    def preview(self, lines=ALIGN_SCAN[0], centre=FRAME_MIDDLE):
         """A quick look at the gate: an alignment scan (8-bit grey of ALIGN_CHANNEL at ALIGN_GAIN, at 1800 dpi, 148 lines a
-        second) of `lines` lines centred on the frame, with the lens where it is; no lamp settle and no level correction.
-        Its columns are those of a frame scan (CCD pixels from the gate start, as frame_edge() counts them), so the whole
-        gate shows; line r lies at preview_step(r) carriage steps. The default 600 lines are the middle third of the frame
-        (about 4 s of stream); FRAME_SCAN[0] lines show it whole (about 12 s). The 300 dpi proof was tried first and
-        cannot be read on dense film (man1, lev2: its line split takes dark picture for line ends), where this scan reads
-        well. Logs its time; an empty Frame in a dry run."""
-        self.preview_at = max(FRAME_SCAN[1], FRAME_MIDDLE - lines // 2)
+        second) of `lines` lines centred on `centre` carriage steps (kept within the frame scan's steps), with the lens where
+        it is; no lamp settle and no level correction. Its columns are those of a frame scan (CCD pixels from the gate
+        start, as frame_edge() counts them), so the whole gate shows; line r lies at preview_step(r) carriage steps. The
+        default 600 lines are the middle third of the frame (about 4 s of stream); FRAME_SCAN[0] lines show it whole (about
+        12 s); QUICK_PREVIEW is the fastest look at where the film lies (2 s of stream, the shortest carriage trips). The
+        300 dpi proof was tried first and cannot be read on dense film (man1, lev2: its line split takes dark picture for
+        line ends), where this scan reads well. Logs its time; an empty Frame in a dry run."""
+        self.preview_at = min(max(FRAME_SCAN[1], centre - lines // 2), FRAME_SCAN[1] + FRAME_SCAN[0] - lines)
         t0 = time.time()
         frame = self.scan(lines, self.preview_at, (ALIGN_GAIN,) * 3, warmup=0.0, depth=8, grey=True, channel=ALIGN_CHANNEL)
         if not self.dry_run:
@@ -2253,6 +2261,7 @@ class PF1800:
         group = FINE_MAX if fine else 2 if forward else 1  # units per hole read, which is exact only modulo the pitch
         name = f"{'fine' if fine else 'coarse'} unit(s) {'forward' if forward else 'back'}"
         self.stopped_at_start = False
+        reversal = self._feed_dir == (-1 if forward else 1)
         self._start_state()  # bit 6 before the first unit, for start_lead
         last = self._rest_holes or self._hole_read()
         moved, done, stop = 0.0, 0, None
@@ -2272,7 +2281,11 @@ class PF1800:
                     # going back from the tail (page B bits 7 and 6 clear): the unit was fed and brings it back over bit 6
                 k += 1
             if k:
-                last, d = self._measure(last, (-k if forward else k) * per, f"{k} {name}")
+                expect = k * per
+                if reversal and not fine:  # the first coarse unit after a reversal is short by the slack (speed1: a unit
+                    expect += AFTER_BACK_PX - per  # forward after one back moved 148 px; against 320 it read 489)
+                reversal = False
+                last, d = self._measure(last, -expect if forward else expect, f"{k} {name}")
                 self._note_start(-d / COARSE_PX if fine else k if forward else -k)
                 moved -= d
                 done += k

@@ -463,6 +463,8 @@ clears. With bit 6 clear and bit 7 set, the strip is at its start already, so no
 
 - **Measure in short legs.** A hole read is exact only modulo the pitch, so read after every 2 coarse units forward, every coarse unit
   back and every 7 fine units, as the closed-loop feed does. A lost coarse unit still reads as a normal one; look at a preview.
+  Expect the first coarse unit after a change of direction to be short (139 to 265 px on the unit): read against a normal
+  unit's 320, a forward unit of 148 after one back read 489, a whole pitch out (speed1).
 - **Check before every unit back.** Never with no film on bits 7, 6 and 0. Near the start (bit 6 clear, bit 7 set) go back no further
   than `rewind()` does: 3 coarse units after bit 6 clears, counted in units, not pixels, as their travel varies. Units fed forward
   while bit 6 is clear can be taken back. Going back from the tail, with bits 7 and 6 clear and bit 0 set, is fine: the tail comes
