@@ -175,6 +175,9 @@ MIN_GAP, WIDE_GAP, GAP_FLAT, GAP_BASE, GAP_WIDTH = 60, 250, 8.0, 0.75, 134  # ga
 # and an edge only from a gap cut by the gate start or a whole gap at least SCRATCH_GAP wide with film on both sides: a gap
 # cut by the gate's end, and thinner runs, were false there (roll48 align25, roll50 align02 at 370 to 435)
 CLEAR_SHARE, CLEAR_BANDS, CLEAR_BRIDGE, SCRATCH_GAP = 0.83, 8, 20, 90
+LINE_BANDS, LINE_W, LINE_GAP, LINE_CAP, LINE_MIN = 16, 16, 3, 6, 76  # frame_ends(): straight steps over the rows
+LINE_CLEAR, LINE_EVEN, LINE_SURE = 40, 0.03, 80  # frame_ends(): columns after a frame end that must be clear film in every
+# row band; frame_edge(): the score of a frame end that places a frame in a run wider than a gap
 GATE_TOUCH = 25  # a gap ending this close to GATE_END runs into the gate's mask even where mask() cannot see it; with no
 # better inner edge it places the frame before it (roll22 frame 1: a gap ending at 2681 of 2686 was taken for an inner one,
 # a false edge at 1695 was found in bright picture and the whole frame before the gap lost)
@@ -835,8 +838,10 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
     next frame, starts FRAME_PX after the frame's left edge, which may then lie up to CUT_OK pixels before the gate
     (negative: that much of the frame is lost, better than feeding it out of the gate). Otherwise the first edge at or
     right of `at_least` after an inner gap of at least MIN_GAP columns (its right end + 1, or its left end + `gap` when it
-    is wider than WIDE_GAP, a thin, uniform part of the next frame then continuing it). A gap running into the gate's end
-    gives way to such an inner edge when its darkest row lies more than FALSE_DIP lower than the inner gap's (roll36b and
+    is wider than WIDE_GAP, a thin, uniform part of the next frame then continuing it). A run wider than a gap that holds
+    a frame end (frame_ends(), at least LINE_SURE) is placed by that end instead (_edge_after()): on a strip of flash and
+    night pictures whose clear backgrounds ran into the gaps (edge1) the guesses were up to 600 px out; on 542 older
+    alignment scans it changes 13, most to a visible gap's true end. A gap running into the gate's end gives way to such an inner edge when its darkest row lies more than FALSE_DIP lower than the inner gap's (roll36b and
     roll36c frame 7: pale picture at the gate end, darkest row 0.74 against 0.93, put the frame at -69 instead of feeding the
     real gap's edge, 207, in). With clear film in the gate an inner gap must overlap it, and with no edge from the flat runs
     scratched_edge() has the last word, so None if neither finds one."""
@@ -852,11 +857,21 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
         # at 234-345 passed for the mask, the gap was taken for the one before the gate end, and the frame was missed)
         return x >= len(level) or (x >= GATE_END - GATE_TOUCH and level[x] < 0.15 * base and spread[x] < 2)
 
+    ends = None
+
+    def wide(s, e, guess):  # a run wider than a gap: where a frame ends inside it, the gap begins there (frame_ends())
+        nonlocal ends
+        if ends is None:
+            ends = [x for x, score in frame_ends(r) if score >= LINE_SURE]
+        inside = [x for x in ends if s <= x <= e]
+        return _edge_after(r, inside[0]) if inside else guess
+
     clear = clear_gaps(r)
     placed, inner, trailing, touching = [], [], [], []
     for s, e in plausible_gaps(r, frame_gaps(r, min_len=EDGE_GAP)):
         if s == 0:  # wider than a gap: gap and pale picture run together, and where the gap ends is unknown; under-feeding
-            placed.append(e + 1 if e < WIDE_GAP else EDGE_AT)  # can be put right after the frame scan, overshooting cannot
+            placed.append(e + 1 if e < WIDE_GAP else wide(s, e, EDGE_AT))  # can be put right after the frame scan,
+            # overshooting cannot
         elif mask(e + 4):
             placed.append(s - FRAME_PX)
         elif e >= GATE_END - GATE_TOUCH:  # runs into the mask unseen; its estimate of the frame edge is the less exact
@@ -864,7 +879,7 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
         elif e - s + 1 >= MIN_GAP and (not clear or any(cs <= e and s <= ce for cs, ce in clear)):
             # with clear film elsewhere in the gate, a flat run that is not clear film is an even wall (roll52b align02: 2022
             # to 2123 beside the real gap at 2512, and the frame in the gate between them was fed past)
-            inner.append((e + 1 if e - s < WIDE_GAP else s + gap, dip(s, e)))
+            inner.append((e + 1 if e - s < WIDE_GAP else wide(s, e, s + gap), dip(s, e)))
             if -CUT_OK <= s - FRAME_PX <= EDGE_AT:
                 trailing.append((s, s - FRAME_PX))
     placed = [x for x in placed if x >= -CUT_OK]
@@ -880,6 +895,93 @@ def frame_edge(r, at_least=0, gap=GAP_WIDTH):
         if not any(x < s for x, _ in inner):
             return left
     return inner[0][0] if inner else scratched_edge(r, at_least)
+
+
+def _line_steps(r):
+    """Straight steps across the rows of a negative (`r`): for each column x (the returned array), each of LINE_BANDS row
+    bands' step from the LINE_W columns before x - LINE_GAP to the LINE_W from x + LINE_GAP, less a smooth gradient (the
+    lamp's fall-off; only where the windows beyond both agree on it, so a big step does not read as one), in units of that
+    band's column-to-column scatter (which holds the CCD's column streaks, themselves straight down every row). Medians
+    over each window, so a single streaked column hardly moves it. Returns (x, z): z is bands x len(x), positive where
+    the film is clearer to the right."""
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    w, g = LINE_W, LINE_GAP
+    m = np.array([band.mean(0) for band in np.array_split(r[:, :GATE_END], LINE_BANDS)])
+    stat = np.median(sliding_window_view(m, w, axis=1), axis=2)  # stat[:, i]: columns i to i + w - 1
+    x = np.arange(2 * w + g, m.shape[1] - 2 * w - g)
+    far_l, left, right, far_r = stat[:, x - g - 2 * w], stat[:, x - g - w], stat[:, x + g], stat[:, x + g + w]
+    a, b = left - far_l, far_r - right
+    trend = np.where(a * b > 0, np.sign(a) * np.minimum(abs(a), abs(b)), 0.0) * (w + 2 * g) / w
+    scatter = 1.4826 * np.median(np.abs(np.diff(m, axis=1)), axis=1) / np.sqrt(2)
+    return x, (right - left - trend) / (scatter[:, None] * np.sqrt(2.0 / w) * 1.25 + 1e-9)
+
+
+def _band_levels(r):
+    """Each of LINE_BANDS row bands' column means, and each band's clear level (the 97th percentile of those under
+    OPEN_LIGHT: past a strip's cut end the gate shows open light, which is not film), as a column for dividing by."""
+    import numpy as np
+
+    m = np.array([band.mean(0) for band in np.array_split(r[:, :GATE_END], LINE_BANDS)])
+    ref = [np.percentile(row[row < OPEN_LIGHT], 97) if (row < OPEN_LIGHT).any() else 1.0 for row in m]
+    return m, np.maximum(np.array(ref), 1.0)[:, None]
+
+
+def frame_ends(r):
+    """Frame ends in a negative (`r`: an alignment plane or a preview, rows x columns) as [(x, score)], strongest first: x
+    is the first column of the gap after a frame. Where a night scene's or a flash picture's background is as clear as
+    the film between frames, a gap is not a flat run of its own (frame_gaps() runs it into the pictures on either side),
+    but a frame still ends on a straight line over every row: the picture stops and the gap begins at one column, however
+    faint the step. A frame end is such a step up (clearer to the right) in nearly every row band, scoring at least
+    LINE_MIN of LINE_BANDS * LINE_CAP (each band adds its step in scatter units up to LINE_CAP and takes off twice a step
+    the other way), with clear film over every band for the LINE_CLEAR columns after it (each band's level at least
+    CLEAR_SHARE of its own clear level, the 97th percentile of its column means, and the bands even to LINE_EVEN), at
+    least GAP_BASE of the film base (on a dense frame a band's clearest columns are picture: roll52b align04) and not
+    open light (a cut end, or a CCD feature at 2305 that reads as a step in open light).
+    edge1 (a strip of flash and night pictures, 9 whole-frame previews along it): the true ends scored 82 to 91 over all
+    rows and 79 to 96 over the middle 600, and passed the clear test; the best picture edge passing it scored 64 (over
+    all rows) and 62 (600 rows)."""
+    import numpy as np
+
+    x, z = _line_steps(r)
+    score = (np.clip(z, 0, LINE_CAP) - 2 * np.clip(-z, 0, LINE_CAP)).sum(0)
+    m, ref = _band_levels(r)
+    film = r[:, :GATE_END][r[:, :GATE_END] < OPEN_LIGHT]
+    base = float(np.percentile(film, 99.5)) if film.size else 0.0
+    found = []
+    for i in np.argsort(score)[::-1]:
+        if score[i] < LINE_MIN:
+            break
+        at = int(x[i])
+        if at > GATE_END - LINE_CLEAR or any(abs(at - f) < 2 * LINE_W for f, _ in found):
+            continue
+        raw = m[:, at + 2 : at + LINE_CLEAR].mean(1)
+        side = raw / ref[:, 0]
+        if (side.min() >= CLEAR_SHARE and side.std() <= LINE_EVEN and raw.min() >= GAP_BASE * base
+                and raw.max() < OPEN_LIGHT):
+            found.append((at, float(score[i])))
+    return found
+
+
+def _edge_after(r, end):
+    """The left edge of a frame placed by a frame end (frame_ends()) at column `end`: the frame's own end where it lies at
+    least FRAME_PX - CUT_OK in (the frame starts FRAME_PX before it); otherwise the previous frame's, and the frame starts
+    where picture first shows in some row band after it (below CLEAR_SHARE of that band's clear level), if that is within
+    GAP_WIDTH, or else MIN_GAP after the end: a frame may begin with picture as clear as the gap (edge1, whose gaps were
+    about 77 px; older rolls' 110 to 140), and an edge read early under-feeds, which a frame scan's check puts right,
+    where one read late overshoots."""
+    import numpy as np
+
+    if end >= FRAME_PX - CUT_OK:
+        return end - FRAME_PX
+    m, ref = _band_levels(r)
+    level = np.min(m / ref, axis=0)
+    level = np.convolve(np.pad(level, 4, mode="edge"), np.ones(9) / 9, "valid")
+    for x in range(end + LINE_CLEAR, min(end + GAP_WIDTH, GATE_END)):
+        if level[x] < CLEAR_SHARE:
+            return x
+    return min(end + MIN_GAP, GATE_END)
 
 
 def frame_scan_gaps(r):
