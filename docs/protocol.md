@@ -449,7 +449,8 @@ that finds no edge only means the end if the gate shows open light: with film th
 
 An uncut roll starts with a fogged black leader. Its alignment scan is dark in every column. Cut it off before loading.
 
-**Eject**: carriage home, then bursts of 8 coarse units forward while page B bit 6 sees film, then one more burst. The strip leaves through the
+**Eject**: carriage home, then bursts of 8 coarse units forward while page B bit 6 sees film, then one more burst (the driver gives up after 48 bursts, more than a whole 36-exposure roll, so a strip ejected from the middle of a roll
+is not taken for stuck). The strip leaves through the
 exit slot, on the same side as the entrance: keep the entering film and the exiting film apart, since a likely cause of stalls is one
 dragging on the other.
 

@@ -26,7 +26,7 @@ stuck, a power cycle backs it out.
 You need Python 3 and libusb (`brew install libusb` on macOS).
 
 ```sh
-pip install git+https://github.com/Pr0fB0ff/primefilm-1800afl@v0.2.2
+pip install git+https://github.com/Pr0fB0ff/primefilm-1800afl@v0.2.3
 ```
 
 To work on the driver, clone the repository and run `pip install -e .` inside it.

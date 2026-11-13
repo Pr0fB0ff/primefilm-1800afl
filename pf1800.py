@@ -142,6 +142,9 @@ PERF_PITCH = 341  # pixels between sprocket holes (4.75 mm)
 PX_PER_MM = PERF_PITCH / 4.75
 FINE_PX, COARSE_LEFT, FEED_TOLERANCE = 15.0, 345, 8  # fine units close the last COARSE_LEFT pixels to within the tolerance
 REWIND_MAX = 64  # coarse units rewind() may feed back: a 6-frame strip is about 50 (8 per frame); its end took 23 for 3
+EJECT_BURSTS = 48  # bursts of 8 coarse units eject() may send while page B bit 6 sees film: 384 units, about 1.7 m at
+# about 4.5 mm a unit, more than a whole 36-exposure roll (about 39 frames of 8 to 10 units). It was 8 (64 units, about 7.5
+# frames), which is plenty at the end of a scan but stopped an eject from the middle of a roll (the drive window) as stuck.
 REWIND_FIND = 16  # units back within which the strip's tail must reach page B bit 6 when it starts past it (live: 0)
 REWIND_PAST = 3  # more units back once bit 6 clears: it clears about 760 px in from where the auto-load holds the strip
 # (rw1, proof6: the first frame's left edge then lay 760 px past the gate start and the alignment took a false gap)
@@ -2105,7 +2108,7 @@ class PF1800:
         """The next frame's edge as a strip frame scan shows it (next_edge()); None when it does not, or in a dry run."""
         return None if self.dry_run or not frame.lines else next_edge(align_plane(frame))
 
-    def eject(self, bursts=8):
+    def eject(self, bursts=EJECT_BURSTS):
         """The vendor's eject (opcode 8): bursts of 8 coarse units forward while page B bit 6 sees film, then 8 more; the
         strip leaves through the exit slot. The carriage goes home first, as the vendor does. Returns the film sensors
         afterwards."""
