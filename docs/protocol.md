@@ -256,6 +256,18 @@ the rest of the stream at the offset between -3 and +3 bytes that makes the line
 extra at its start, and ends with a marker of 11 zero samples, so take the samples before each marker (`sync_proof_lines()`).
 16-bit mono at 300 dpi gave noise.
 
+Kept that way (432 samples, mirrored as a 1800 dpi line is), sample k lies over column 6k + 63 of a 1800 dpi strip frame scan
+(three frames registered: 62 to 65), so a proof misses the first 63 and the last 30 columns of the gate. About one line in ten
+sits 4 to 9 samples early; the cause is not known. That is fine for seeing where the film lies, but not for measuring
+edges, and on dense film it fails (below), so the driver's `preview()` uses an alignment scan instead.
+
+**Dense film breaks the line split.** The 11 dark samples ending each line move with the front-end offset and gain like the
+picture does (at the red offset 160 or 120 they read about 25, and no line end is found at all), so they look like the CCD's
+dark reference pixels rather than a marker the controller adds. Where the film is dense enough to read 0 to 2 as well (man1,
+lev1, lev2: median 1 at gain 2), the split takes picture for line ends and the proof comes out as noise and repeated lines.
+Read one per transfer, the stream comes in 448-byte pieces that do not follow the lines: a fixed 448-sample split shears by
+about 4.5 samples a line, so a line is about 452 samples. A robust split, and so a preview of dense film, is still to be found.
+
 ### Line period
 
 The byte in `88` and `C6` sets the line time, which is proportional to 256 minus the byte, and with one motor step per line it
@@ -387,8 +399,13 @@ Three behaviours shape everything else:
 
 1. **Reversing loses a varying slack** of 90 to 190 px. After a reversal fine units hardly move at all until a coarse unit forward takes up the
    slack. Position by feeding forward only, and recover a frame fed too far by going back past it, one coarse unit forward, then fine units.
-2. **Fine units stall at random** along a long roll, and once the strip's tail has left the entrance roller, which is all they drive. The last
-   frames may need a coarse unit, with whatever overshoot it brings.
+2. **Fine units stall at one place against the perforations**, and once the strip's tail has left the entrance roller, which is all they drive.
+   In a run every stall falls with the first hole in one band of the pitch, about 110 px wide, placed differently from run to run. What catches the
+   film is not known. It does not always catch: on a clean strip the film passed about as often as it stopped, on a scratched one it stopped nearly
+   every pitch. Only a coarse unit is sure to pass, and waiting, command 7 or one fine unit back do not help. A coarse unit is about 40 px short of a
+   pitch, so it moves the holes back up the pitch: with holes that would lie in the band, a target has no route that avoids a fine feed across it.
+   Once stalls have placed the band, a hole read warns of a stall before it happens. The last frames may need a coarse unit, with whatever
+   overshoot it brings.
 3. **Hole reads are exact only modulo the pitch.** Expect under half a pitch per round of fine units (about 7 units), or a stall reads as a
    whole perforation.
 
@@ -407,6 +424,12 @@ To find it, scan 600 lines from step 2000 in 8-bit grey (red at gain 5) and look
 all rows, at least 60 px wide. Pale, even picture beside a gap can look like one in a shorter scan, so use all 600 rows. A gap ending at the gate's
 end may just be running into the gate's mask. See `frame_edge()`.
 
+Long scratches run along the film through its gaps, so a scratched gap is not even over the rows. Where that test finds no edge, look for clear film
+instead: split the rows into 8 bands, take each column's darkest band median, and keep the runs at 0.83 of the film base or more, closing breaks
+up to 20 px wide. A gap is clear over every row, where bright picture is not: real gaps read 0.86 to 0.90 by this measure, and pale picture under 0.8.
+The same runs serve the checks on a frame's own scan. With clear film in view, an even run that does not overlap it is an even part of the picture,
+not a gap. These limits rest on one scratched strip. See `clear_gaps()` and `scratched_edge()`.
+
 Then a whole roll runs as:
 
 1. Align frame 1 from the scan and feed its edge to 45, checking with a short scan (150 lines) after each feed, up to 3 times. Where the check and
@@ -414,7 +437,9 @@ Then a whole roll runs as:
 2. Autofocus on frame 1. Set the gain from the film base in that first scan.
 3. Scan 1800 lines from step 1500.
 4. Check the frame's own scan: where the gap really is over all rows shows a frame too far in or too far on. If so, place it and scan again, once.
-5. Feed about 38 mm less a margin, stopping short if the last scan shows the next frame's edge, and align again.
+5. Where the frame's own left edge shows in its scan, the next edge lies 38 mm on from it: feed that edge to 35 and confirm it with one short scan.
+   Otherwise, or where that scan and the holes disagree by more than 60 px, feed about 38 mm less a margin, stopping short if the last scan shows the
+   next frame's edge, and align again in full. A strip with uneven spacing takes the full alignment more often.
 6. Stop at the end (below).
 
 ### The end of a strip
@@ -424,7 +449,8 @@ that finds no edge only means the end if the gate shows open light: with film th
 
 An uncut roll starts with a fogged black leader. Its alignment scan is dark in every column. Cut it off before loading.
 
-**Eject**: carriage home, then bursts of 8 coarse units forward while page B bit 6 sees film, then one more burst. The strip leaves through the
+**Eject**: carriage home, then bursts of 8 coarse units forward while page B bit 6 sees film, then one more burst (the driver gives up after 48 bursts, more than a whole 36-exposure roll, so a strip ejected from the middle of a roll
+is not taken for stuck). The strip leaves through the
 exit slot, on the same side as the entrance: keep the entering film and the exiting film apart, since a likely cause of stalls is one
 dragging on the other.
 
@@ -432,13 +458,41 @@ dragging on the other.
 the start pushes the strip out of the entrance. Bit 6 clears about 760 px in from the auto-load position, so feed 3 more units back after it
 clears. With bit 6 clear and bit 7 set, the strip is at its start already, so nothing should move.
 
+### Moving by hand
+
+`jog()`, `seek_frames()` and `lens_to()` let a caller place the film itself; the rules are the ones above.
+
+- **Measure in short legs.** A hole read is exact only modulo the pitch, so read after every 2 coarse units forward, every coarse unit
+  back and every 7 fine units, as the closed-loop feed does. A lost coarse unit still reads as a normal one; look at a preview.
+  Expect the first coarse unit after a change of direction to be short (139 to 265 px on the unit): read against a normal
+  unit's 320, a forward unit of 148 after one back read 489, a whole pitch out (speed1).
+- **Check before every unit back.** Never with no film on bits 7, 6 and 0. Near the start (bit 6 clear, bit 7 set) go back no further
+  than `rewind()` does: 3 coarse units after bit 6 clears, counted in units, not pixels, as their travel varies. Units fed forward
+  while bit 6 is clear can be taken back. Going back from the tail, with bits 7 and 6 clear and bit 0 set, is fine: the tail comes
+  back over bit 6. The automatic back-off follows the same rule. On the unit (start1) the last units back before that point read a
+  single hole each, 316 to 333 px, which may be units that did not move (a stall folds to about 341).
+- **Fine units are weak.** They stall where a perforation reaches one band of the pitch, about 110 px wide and placed differently from
+  run to run, and hardly move after a reversal until a coarse unit forward. A coarse unit gets past both.
+- **Seek by frames with coarse units, then align.** Forward, feed about 100 px a frame short of the 38 mm pitch: an overshoot past the
+  gate start takes the next frame's gap, while a shortfall of up to about 2400 px is still found by the alignment. Back, go about 1000
+  px past the frame's place, then one coarse unit forward to take up the reversal slack, then align; a seek that reaches the start
+  leaves that unit out, since it would take frame 1 out of the gate. On a simulated strip with the measured unit scatter and stalls,
+  every such seek of -5 to +5 frames landed on the right frame, and none went back further than `rewind()`. On the unit a seek forward
+  and one back to the start landed on the right frames (man1, start1), but at the start the frame was left 0 to 70 px past the gate
+  start: fine units do not move after the reversal, and the back-off that would correct an overshoot is not allowed there. Trips of
+  more than 64 units back have not been tried on the unit.
+- **Set the lens the way autofocus does**: lens home, the moves, then stationary reads for a score. Once, after lens moves made inside
+  scans, the lens stopped following any command until a power cycle; the cause is not known. A score that stays the same at every
+  setting shows a stuck lens.
+
 ## Picture corrections
 
 None of this is protocol, but a driver will want it. Each is the host's job, since the scanner applies no calibration of its own.
 
 - **Flat-field**: open light from the calibration window at step 30 and dark at step 700, 64 lines each, per pixel, at the same settings as the scan.
 - **Response sag along a roll**: open light fell 14 % over 39 frames, caused by scanning and not lamp age, and each frame's clear film tracked it. Read open
-  light before each frame and scale the frame to frame 1. Seek home before each reading: the tracked position drifts over a long run.
+  light before the first two frames and then every third, take the trend for the frames between, and scale each frame to frame 1. Seek home before each
+  reading: the tracked position drifts over a long run.
 - **Falloff along the CCD**: about 0.95 of the middle at a frame's left end and 0.88 at its right.
 
 ## Not known
