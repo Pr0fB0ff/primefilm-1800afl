@@ -41,8 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pf1800 import (ALIGN_SCAN, BLACK_TARGET, CAL_DARK_AT, CAL_LINES, DEFAULT_LEVELS, FRAME_SCAN, LINE_PERIOD, LONG_LINE,
-                    PF1800, RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns, is_leader,
-                    is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
+                    PF1800, RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns,
+                    is_empty_gate, is_leader, is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
 
 # Autofocus sweep (start, step, count, in lens units from home) for a strip: the feeder holds a strip near focus at +0 to
 # +3 (a slide's emulsion is at +40, so it keeps autofocus()'s full 0 to 75), so 0 to 15 is usually enough and follows curl.
@@ -148,56 +148,90 @@ def monitor_reading(scanner):
     return tuple(levels), columns
 
 
-def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_scan=None, cancelled=None, log=print,
-                between=None):
-    """Scan one slide, or every frame of a strip the feeder has caught, on an open `scanner`.
+class RollSession:
+    """The levels a roll's frames share, and the scan of one frame with them: the lamp settle, the gain (from open light,
+    then a strip's from its first alignment), the black offset, the sag scale and the falloff gain. scan_frames() runs a
+    whole slide or strip with it; a caller that places the film itself (a manual drive: PF1800.jog(), seek_frames()) makes
+    one per strip and calls prepare(), strip_levels() and then scan() for each frame it captures.
 
-    on_frame(n, frame, kind, calibration) gets each finished frame: n counts from 1 (0 for a slide), kind is "frame",
-    "unaligned" (no frame edge was found: whatever was in the gate) or "proof" (the 300 dpi look that set the gain), and
-    calibration is the flat-field reference applied to it, or None. on_align(n, frame, failed) gets each alignment scan.
-    before_scan() runs right before every stream starts, so the caller can finish work that would compete with the USB
-    transfer for the CPU. progress(fraction) is passed on to the scan, cancelled() is polled between frames (a frame
-    under way is finished). between(n), if given, runs on a strip before frame 1 (n 0) and after each frame scan, with
-    the film where it is (--monitor). Ejects the strip at the end if opts.eject. Returns the number of frames scanned."""
-    opts.check()
-    step = opts.step
-    lines, approach = FRAME_SCAN if opts.strip else (opts.lines or 1800 // step, opts.approach)
-    gains, warmup = opts.gains, opts.warmup
-    if opts.focus is not None:
-        scanner.focus = opts.focus
-    elif opts.autofocus and not opts.strip:  # a strip focuses on its first frame, once it is aligned
-        log(f"autofocus: lens +{scanner.autofocus(approach + lines // 2)} units")
-    if opts.grey and opts.settle:
-        scanner.warm_lamp(warmup)
-        warmup = 0.0
-    if opts.grey and gains is None:
-        code = scanner.grey_gain(warmup)
-        gains, warmup = (code,) * 3, 0.0
-        log(f"grey gain {code} (from open light)")
-    calibration = None
-    if opts.flatfield:
-        calibration = scanner.calibrate(opts.depth, gains, opts.offsets, warmup, grey=opts.grey)
-        warmup = 0.0
+    on_frame, progress, before_scan and log are as for scan_frames()."""
 
-    frame_line = LINE_PERIOD  # the frame scans' line period: a strip's, once its gain is picked for it
-    black = {"offsets": None, "slope": None}  # the red offset kept at BLACK_TARGET (strips, see pf1800.black_offset())
-    # open light at frame 1, this frame's scale (pf1800.OPEN_PERCENTILE), and the falloff gain from frame 1's reading
-    sag = {"on": False, "first": None, "scale": 1.0, "flat": None, "reads": []}  # reads: (frame n, level)
+    def __init__(self, scanner, opts, on_frame=None, progress=None, before_scan=None, log=print):
+        opts.check()
+        self.scanner, self.opts, self.on_frame = scanner, opts, on_frame
+        self.progress, self.before_scan, self.log = progress, before_scan, log
+        self.step = opts.step
+        self.lines, self.approach = FRAME_SCAN if opts.strip else (opts.lines or 1800 // self.step, opts.approach)
+        self.gains, self.warmup = opts.gains, opts.warmup  # warmup: what is left of it for the next scan
+        self.calibration = None
+        self.frame_line = LINE_PERIOD  # the frame scans' line period: a strip's, once its gain is picked for it
+        self.black = {"offsets": None, "slope": None}  # the red offset kept at BLACK_TARGET (strips, see pf1800.black_offset())
+        # open light at frame 1, this frame's scale (pf1800.OPEN_PERCENTILE), and the falloff gain from frame 1's reading
+        self.sag = {"on": False, "first": None, "scale": 1.0, "flat": None, "reads": []}  # reads: (frame n, level)
 
-    def scan_one(n, kind, warmup):
-        use = gains
+    def prepare(self):
+        """Before the first frame: a slide's autofocus (a strip focuses on its first frame, once it is aligned), the lamp,
+        the gain from open light and the flat-field references, as the options ask."""
+        scanner, opts, log = self.scanner, self.opts, self.log
+        if opts.focus is not None:
+            scanner.focus = opts.focus
+        elif opts.autofocus and not opts.strip:
+            log(f"autofocus: lens +{scanner.autofocus(self.approach + self.lines // 2)} units")
+        if opts.grey and opts.settle:
+            scanner.warm_lamp(self.warmup)
+            self.warmup = 0.0
+        if opts.grey and self.gains is None:
+            code = scanner.grey_gain(self.warmup)
+            self.gains, self.warmup = (code,) * 3, 0.0
+            log(f"grey gain {code} (from open light)")
+        if opts.flatfield:
+            self.calibration = scanner.calibrate(opts.depth, self.gains, opts.offsets, self.warmup, grey=opts.grey)
+            self.warmup = 0.0
+
+    def strip_levels(self, align):
+        """A strip's levels from an alignment scan of it (`align`, pf1800.align_scan()), after prepare(): one gain for the
+        whole roll from its brightest part, the film base, the same along the roll, so every frame shares one gain and one
+        level scale (only when the gain was picked from open light, without the proof, which sets each frame's own, and
+        without flat-field correction, calibrated at that gain); then the black offset at that gain (the fixed offsets clip
+        the densest negative to 0 at gain 15, roll36e), and the sag correction on."""
+        scanner, opts, step = self.scanner, self.opts, self.step
+        plain = opts.grey and not opts.proof and self.calibration is None and step == 1
+        if plain and opts.gains is None:
+            line = scanner.strip_line(align, opts.line)  # the longest line the film base takes, up to opts.line
+            code = scanner.align_gain(align, line_exposure(line))
+            if code is not None:
+                self.log(f"strip gain {code}, line {line:#x}, from the first alignment (open light gave {self.gains[0]})")
+                self.gains = (code,) * 3
+                self.frame_line = line
+        if plain and opts.depth == 16 and opts.offsets is None:
+            found = scanner.black_offset(self.gains, ALIGN_SCAN[1])
+            if found is not None:
+                code, slope = found
+                _, (_, g0, b0) = DEFAULT_LEVELS[16]
+                self.black.update(offsets=(code, g0, b0), slope=slope)
+        self.sag["on"] = opts.sag and plain and opts.depth == 16
+
+    def _before(self):
+        if self.before_scan:
+            self.before_scan()
+
+    def scan(self, n, kind="frame", warmup=0.0, place=True):
+        """Scan frame `n` (0 for a slide) of `kind` ("frame" or "unaligned") as it lies, hand it to on_frame and return it
+        (None when nothing was read). With `place`, a strip frame that the scan shows lying too far in or fed too far is put
+        in place and scanned again, once; a caller that placed the frame by hand passes False."""
+        scanner, opts, log, sag, black = self.scanner, self.opts, self.log, self.sag, self.black
+        use = self.gains
         if opts.proof:  # the 300 dpi proof of this frame sets its 1800 dpi gain
-            if before_scan:
-                before_scan()
-            shot = scanner.proof_frame(approach)
+            self._before()
+            shot = scanner.proof_frame(self.approach)
             if shot.lines:
-                on_frame(n, shot, "proof", None)
+                if self.on_frame:
+                    self.on_frame(n, shot, "proof", None)
                 use = (scanner.proof_gain(shot),) * 3
-                log(f"frame gain {use[0]} (roll gain {gains[0]})")
+                log(f"frame gain {use[0]} (roll gain {self.gains[0]})")
             warmup = 0.0
         if sag["on"]:  # open light now, against frame 1's: the frame (and a rescan of it) is scaled back to that level
-            if before_scan:
-                before_scan()
+            self._before()
             reads = sag["reads"]
             if n <= SAG_EVERY_FROM or len(reads) < 2 or n - reads[-1][0] >= opts.sag_every:
                 level = scanner.open_level()
@@ -217,12 +251,12 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
                         f"{sag['scale']:.3f}")
 
         def full_scan(warmup):
-            if before_scan:
-                before_scan()
-            scanner.line = frame_line
+            self._before()
+            scanner.line = self.frame_line
             try:
-                frame = scanner.scan(lines, approach, use, black["offsets"] or opts.offsets, warmup, progress=progress,
-                                     depth=8 if step > 1 else opts.depth, grey=opts.grey, step=step)
+                frame = scanner.scan(self.lines, self.approach, use, black["offsets"] or opts.offsets, warmup,
+                                     progress=self.progress, depth=8 if self.step > 1 else opts.depth, grey=opts.grey,
+                                     step=self.step)
             finally:
                 scanner.line = LINE_PERIOD  # the other scans keep theirs: open light would saturate
             if black["offsets"] and frame.lines:  # take the black level off, and move the offset toward BLACK_TARGET
@@ -243,7 +277,7 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
         # picture beside a gap fooled the alignment) or fed too far (its left end lost), put the frame's edge in place and
         # scan it again, once
         off = None
-        if opts.strip and kind == "frame":
+        if opts.strip and kind == "frame" and place:
             off = scanner.late_frame(frame)
             off = scanner.early_frame(frame) if off is None else off
         if off is not None:
@@ -256,11 +290,27 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
                 log(f"frame {n} edge now at {'?' if at is None else at}")
                 frame = full_scan(0.0)
         if frame.lines:
-            if calibration is not None:
-                frame = calibration.apply(frame)
-            on_frame(n, frame, kind, calibration)
+            if self.calibration is not None:
+                frame = self.calibration.apply(frame)
+            if self.on_frame:
+                self.on_frame(n, frame, kind, self.calibration)
             return frame
         return None
+
+
+def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_scan=None, cancelled=None, log=print,
+                between=None):
+    """Scan one slide, or every frame of a strip the feeder has caught, on an open `scanner`.
+
+    on_frame(n, frame, kind, calibration) gets each finished frame: n counts from 1 (0 for a slide), kind is "frame",
+    "unaligned" (no frame edge was found: whatever was in the gate) or "proof" (the 300 dpi look that set the gain), and
+    calibration is the flat-field reference applied to it, or None. on_align(n, frame, failed) gets each alignment scan.
+    before_scan() runs right before every stream starts, so the caller can finish work that would compete with the USB
+    transfer for the CPU. progress(fraction) is passed on to the scan, cancelled() is polled between frames (a frame
+    under way is finished). between(n), if given, runs on a strip before frame 1 (n 0) and after each frame scan, with
+    the film where it is (--monitor). Ejects the strip at the end if opts.eject. Returns the number of frames scanned."""
+    roll = RollSession(scanner, opts, on_frame, progress, before_scan, log)
+    roll.prepare()
 
     def aligned(n, failed=False):  # every alignment scan is kept, to check later how each frame was placed
         frame = scanner.failed_align if failed else getattr(scanner, "last_align", None)
@@ -268,10 +318,10 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
             on_align(n, frame, failed)
 
     if not opts.strip:
-        scan_one(0, "frame", warmup)
+        roll.scan(0, "frame", roll.warmup)
         return 1
     try:
-        scanner.align_frame(warmup=warmup)
+        scanner.align_frame(warmup=roll.warmup)
     except EndOfFilm:
         aligned(1, failed=True)  # no frame edge before the first frame: keep that scan too, to see what the gate held
         if is_leader(align_plane(scanner.failed_align)):
@@ -280,31 +330,15 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
     aligned(1)
     if opts.autofocus and opts.focus is None:  # on frame 1, not on whatever the gate held at load
         sweep = dict(zip(("start", "step", "count"), STRIP_FOCUS))
-        log(f"autofocus: lens +{scanner.autofocus(approach + lines // 2, **sweep, more=STRIP_FOCUS_MORE)} units")
-    # The strip's gain from its first alignment scan, whose brightest part is the film base (the same along the roll), so
-    # every frame shares one gain and one level scale. Only when the gain was picked from open light above (no --gains),
-    # without the proof (which sets each frame's own) and without flat-field correction (calibrated at that gain).
-    if opts.grey and opts.gains is None and not opts.proof and calibration is None and step == 1:
-        code = scanner.align_gain(getattr(scanner, "last_align", None), line_exposure(opts.line))
-        if code is not None:
-            log(f"strip gain {code} from the first alignment (open light gave {gains[0]})")
-            gains = (code,) * 3
-            frame_line = opts.line
-    # the black level, at that gain: the fixed offsets clip the densest negative to 0 at gain 15 (roll36e)
-    if opts.grey and opts.depth == 16 and opts.offsets is None and not opts.proof and calibration is None and step == 1:
-        found = scanner.black_offset(gains, ALIGN_SCAN[1])
-        if found is not None:
-            code, slope = found
-            _, (_, g0, b0) = DEFAULT_LEVELS[16]
-            black.update(offsets=(code, g0, b0), slope=slope)
-    sag["on"] = opts.sag and opts.grey and opts.depth == 16 and not opts.proof and calibration is None and step == 1
+        log(f"autofocus: lens +{scanner.autofocus(roll.approach + roll.lines // 2, **sweep, more=STRIP_FOCUS_MORE)} units")
+    roll.strip_levels(getattr(scanner, "last_align", None))
     n, kind = 0, "frame"
     if between:
         between(0)
     while not (cancelled and cancelled()):
         n += 1
         log(f"frame {n}" if kind == "frame" else f"frame {n} (unaligned: whatever is in the gate)")
-        frame = scan_one(n, kind, 0.0)
+        frame = roll.scan(n, kind)
         if between:
             between(n)
         if (opts.frames and n >= opts.frames) or (scanner.dry_run and n >= 2):  # a dry run shows one advance
@@ -320,9 +354,9 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
                 aligned(n + 1, failed=True)  # no frame edge: keep the alignment scan
             if failed is None or is_open_light(align_plane(failed)) or kind == "unaligned":
                 log(f"end of the strip after {n} frame(s): {e}")
-                if failed is not None:  # scan whatever is in the gate as it stands
+                if failed is not None and not is_empty_gate(align_plane(failed)):  # scan what film is left as it stands
                     log(f"frame {n + 1} (unaligned: whatever is in the gate)")
-                    scan_one(n + 1, "unaligned", 0.0)
+                    roll.scan(n + 1, "unaligned")
                     n += 1
                 break
             # no frame edge, but film fills the gate (a blank or pale frame): scan it as it lies and go on, so the rest of
@@ -348,8 +382,10 @@ def main(argv=None):
                     help="AFE gains R,G,B (each 0..15; default: picked from open light, or per --depth with --rgb)")
     ap.add_argument("--offsets", type=triple, default=None, help="AFE offsets R,G,B (default per --depth)")
     ap.add_argument("--line", type=lambda v: int(v, 0), default=LONG_LINE, metavar="BYTE",
-                    help=f"strip: the frames' line period byte, 0x73 to {LINE_PERIOD:#x}: lower gathers more light and is "
-                         f"slower, the gain picked to match (default {LONG_LINE:#x}, about twice the light and the time)")
+                    help=f"strip: the longest line period byte for the frames, 0x20 to {LINE_PERIOD:#x}: lower gathers "
+                         f"more light and is slower; each strip takes the longest its film base allows, up to this, "
+                         f"with the gain picked to match (default {LONG_LINE:#x}, up to about 4 times the light and the "
+                         f"time)")
     ap.add_argument("--no-falloff", action="store_true",
                     help="strip: do not flatten the light along the CCD (about 5 to 12 %% at the frame's ends)")
     ap.add_argument("--warmup", type=float, default=10.0,
