@@ -100,7 +100,7 @@ close handshake  64 65 16 17
 90=00 80=00 84=00 BE=00 C0=00 86=00 89=00 94=00 01=02    then clean the buffer
 ```
 
-Skipping the reset after the open makes the first MCU command after a power cycle time out.
+The reset alone does not stop the first MCU command after a power cycle going unanswered (below).
 
 **Close**: stop the motor, chip reset, lens home if the lens moved, carriage home, lamp off, close handshake. The handshake does
 not turn the lamp off.
@@ -365,8 +365,13 @@ means the sub-command must not be sent, and the lens does not move.
 version is bits 4 to 2 of the reading that follows. The vendor's feed arithmetic differs below
 version 3 (fine units half the size) [not tried].
 
-**The first MCU command** of a session sometimes goes unanswered, even for 30 s, after a power cycle, a reconnect or a new strip. Closing the
-session, waiting 5 s, opening again and retrying has always worked.
+**The first MCU command** after a power cycle always goes unanswered: bit 0 never goes low, and the status only reads back
+the lines as the host set them (0x7F before, 0x71 after command 4). Sending it again at once fails too, since a command that
+times out leaves the lines mid-handshake. Putting the lines back at rest (the film sensor read: GPIO setup, then pages 0x0A
+and 0x0B) and sending it again answers at once (hs7). The MCU needs a few seconds after the first command: sent 1 s after it, the second went unanswered too. The driver waits
+5 s for the first reply, then does that; if that
+goes unanswered too it closes the session, waits 5 s, opens again and retries (earlier sessions also saw this after a
+reconnect or a new strip).
 
 ## Film sensors
 

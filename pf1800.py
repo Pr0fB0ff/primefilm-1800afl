@@ -51,10 +51,12 @@ CCD_PIXELS = 0xAC0
 TIMING = [0x14, 0, 0, 0x40, 0, 0, 0x30, 0, 0, 0, 0, 0, 1, 2]  # the vendor's variant A (the 2688-pixel CCD of this unit)
 LAMP_LEVEL, LAMP_SECOND = 0xFA, 0xAA
 MCU_BUSY_S = 20  # longest wait for a busy MCU (a long lens move)
-MCU_WAIT_S, MCU_FIRST_WAIT_S = 5.0, 30.0  # longest wait for one MCU handshake step; the retry of a session's first one
+MCU_WAIT_S, MCU_FIRST_WAIT_S = 5.0, 30.0  # longest wait for one MCU handshake step; the reopened session's retry
+MCU_WAKE_S = 5.0  # longest wait for a session's first MCU command: after a power cycle it always goes unanswered (hs2 to
+# hs7), and a command that times out leaves the MCU lines mid-handshake; with the lines put back at rest (film_type()), the
+# next command answers at once (hs7). The MCU needs a few seconds after that first command: with 1 s here the second went
+# unanswered too and the reopen read version 2 (hs8). firmware_version() does that, then falls back on a reopen.
 MCU_REOPEN_S = 5.0  # pause between closing a session whose first MCU handshake went unanswered and reopening it
-# (roll22 to roll24, gf1, blk1, roll39: the first handshake after a power cycle, a reconnect or a fresh strip load went
-# unanswered even for 30 s, and a rerun a few seconds later answered at once; firmware_version() retries it so)
 FLAT_TARGET = 60000 / 65535  # flat-field: open light maps to this share of full scale (the vendor uses 64000; the lower
 # target leaves headroom for the lamp drifting brighter between the reference and the scan, which clipped empty-gate scans)
 MIN_SPAN = 200  # flat-field: smallest light - dark span (16-bit units) divided by; weaker pixels are not amplified
@@ -1137,9 +1139,7 @@ class PF1800:
         self.tr = Transport(dev, not self.dry_run, self.trace)
         for byte in (0x64, 0x65, 0x44, 0x45):  # OpenScanner
             self.tr.ctrl_out(0x0090, 0, bytes([byte]))
-        # The vendor's identification resets the chip before its first MCU command; without it the first
-        # MCU handshake after a power cycle or reconnect timed out (status 0xF1) and only a retry, after close()'s reset, ran.
-        self.safe_initial_chip()
+        self.safe_initial_chip()  # as the vendor's identification does before its first MCU command
 
     def close(self):
         """Best-effort park: chip safe state, lens home when used, carriage to the home zone, lamp off, close handshake."""
@@ -1457,9 +1457,21 @@ class PF1800:
                 self.log(f"MCU: lens command {sub} answered code {answer}")
 
     def firmware_version(self):
-        """The command 4 handshake twice; the version is in status bits 4..2 of the second pass. The first
-        MCU command of a session: when it goes unanswered (MCU_WAIT_S), the session is closed and reopened as a rerun
-        would (open, film_type), and the command tried once more, waiting up to MCU_FIRST_WAIT_S."""
+        """The command 4 handshake twice; the version is in status bits 4..2 of the second pass. The first MCU command
+        of a session: after a power cycle the MCU never answers the first command it is sent, so it waits MCU_WAKE_S,
+        then puts the lines back at rest (film_type()) and sends it again. Should that go unanswered too (MCU_WAIT_S), the
+        session is closed and reopened as a rerun would (open, film_type), and the command tried once more, waiting up
+        to MCU_FIRST_WAIT_S."""
+        self.mcu_wait = MCU_WAKE_S
+        try:
+            self.mcu_command(4)
+        except MCUTimeout:
+            self.log("first MCU command unanswered, as after a power cycle; lines back at rest and again")
+            self.film_type()  # its set_gpio() and sensor reads put the lines back at rest, as in hs7
+            self.mcu_wait = MCU_WAIT_S
+        else:
+            self.mcu_wait = MCU_WAIT_S
+            return self._firmware_reply()
         try:
             self.mcu_command(4)
         except MCUTimeout as e:
@@ -1473,6 +1485,10 @@ class PF1800:
                 self.mcu_command(4)
             finally:
                 self.mcu_wait = MCU_WAIT_S
+        return self._firmware_reply()
+
+    def _firmware_reply(self):
+        """The second pass of command 4, after the first was answered: the version in status bits 4..2."""
         v = 0x10
         self.tr.write_regs((0x83, 0), (0xA3, 0x1E), (0xA1, v))
         self.tr.write_regs((0xA1, v | 2))
