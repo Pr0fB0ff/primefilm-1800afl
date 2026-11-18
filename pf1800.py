@@ -101,6 +101,8 @@ ALIGN_SCALE = 1.05  # 1800 dpi grey frame level (16-bit) / its alignment scan's 
 OPEN_LIGHT = 130  # an alignment scan whose median column reads this or more shows open light in most of the gate: the strip's
 # end has passed (the end of all ten saved rolls and strips: 151 to 194; film base reads 77 to 97). One that finds no frame
 # edge with film still in the gate (a blank or pale frame) does not end the roll.
+EMPTY_GATE_COLS = 27  # an alignment scan with no more than this many gate columns (1 %) under OPEN_LIGHT holds no film:
+# the strip's end has gone by, and nothing is left to scan (is_empty_gate())
 # Black level of 16-bit grey strip frames (probe54, roll36e). At the fixed red offset of DEFAULT_LEVELS (200) and gain 15
 # the black level sits around 0 and drifts down along a roll (roll36e: 3088 at frame 1, 0 from frame 8; roll36b to roll36d
 # 0 throughout), so the densest negative, the picture's highlights, read 0. A lower offset code raises it, by about 165
@@ -1054,6 +1056,15 @@ def late_edge(r):
     return edge if edge > GATE_END - FRAME_PX + RESCAN_LOSS else None
 
 
+def is_empty_gate(r):
+    """True when an alignment plane shows no film at all: open light (OPEN_LIGHT) in all but EMPTY_GATE_COLS columns of
+    the gate. On 552 saved alignment scans the empty gates leave 0 to 12 columns under it (the gate end's last few), and
+    every strip end with film still in the gate 100 or more."""
+    import numpy as np
+
+    return bool(np.count_nonzero(r.mean(0)[:GATE_END] < OPEN_LIGHT) <= EMPTY_GATE_COLS)
+
+
 def is_open_light(r):
     """True when an alignment plane shows open light over most of the gate (OPEN_LIGHT): the strip's end has gone by."""
     import numpy as np
@@ -1979,6 +1990,9 @@ class PF1800:
         if self.dry_run:
             self.feed_forward(1000)
             return None
+        if is_empty_gate(align_plane(frame)):  # frame_edge() can read an edge in open light (roll37, roll38)
+            self.failed_align = frame
+            raise EndOfFilm("no film in the gate")
         edge = frame_edge(align_plane(frame), near)
         if short and edge is None:
             self.log("short alignment scan found no edge; scanning in full")
@@ -2103,6 +2117,9 @@ class PF1800:
         moved = self.feed_forward(edge - PREDICT_AT, over_ok=PREDICT_AT, short_ok=GATE_END - FRAME_PX - PREDICT_AT)
         holes = edge if moved is None else round(edge - moved)
         seen = self._check_edge(edge)
+        if not self.dry_run and is_empty_gate(align_plane(self.last_check)):  # the strip's end has gone by (line1)
+            self.failed_align = self.last_check
+            raise EndOfFilm("no film in the gate")
         if seen is None or abs(seen - holes) > CHECK_AGREE:
             self.log(f"the check scan ({seen}) and the hole reads ({holes}) do not agree; aligning")
             return None

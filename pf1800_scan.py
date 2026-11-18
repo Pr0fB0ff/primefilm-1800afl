@@ -41,8 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pf1800 import (ALIGN_SCAN, BLACK_TARGET, CAL_DARK_AT, CAL_LINES, DEFAULT_LEVELS, FRAME_SCAN, LINE_PERIOD, LONG_LINE,
-                    PF1800, RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns, is_leader,
-                    is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
+                    PF1800, RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns,
+                    is_empty_gate, is_leader, is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
 
 # Autofocus sweep (start, step, count, in lens units from home) for a strip: the feeder holds a strip near focus at +0 to
 # +3 (a slide's emulsion is at +40, so it keeps autofocus()'s full 0 to 75), so 0 to 15 is usually enough and follows curl.
@@ -354,7 +354,7 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
                 aligned(n + 1, failed=True)  # no frame edge: keep the alignment scan
             if failed is None or is_open_light(align_plane(failed)) or kind == "unaligned":
                 log(f"end of the strip after {n} frame(s): {e}")
-                if failed is not None:  # scan whatever is in the gate as it stands
+                if failed is not None and not is_empty_gate(align_plane(failed)):  # scan what film is left as it stands
                     log(f"frame {n + 1} (unaligned: whatever is in the gate)")
                     roll.scan(n + 1, "unaligned")
                     n += 1
