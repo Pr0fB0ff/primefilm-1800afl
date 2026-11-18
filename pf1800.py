@@ -19,6 +19,7 @@ pixels 178 to 2720, so the default scan reads the whole CCD line for 1800 lines 
 
 from __future__ import annotations
 
+import math
 import struct
 import time
 import zlib
@@ -68,10 +69,16 @@ BACKLASH_OVERSHOOT = 100  # steps a move toward home overshoots before coming ba
 # (98 lines/s, 530 KB/s, about 18 s for 1800 lines) leaves a third of the bus spare. 16-bit colour streams 48 lines/s.
 GREY_BB = 5  # 0xBB for 16-bit grey; 0xC8 is GREY_BB + 1, as the vendor pairs them
 # The byte in 0x88 and 0xC6 sets the line time, which is proportional to 256 minus the byte, and so the light each line
-# gathers (noise1). A strip's frames run at LONG_LINE: at 0x90 with the gain cut to match, signal to noise on dense film is
-# about twice that at LINE_PERIOD, the dark noise not rising with the time, for 39 s a frame against 18. Open light tops
-# out near 30000 at gain 0, past about 0x90, and 0xE8 is too fast (the stream breaks).
-LINE_PERIOD, LONG_LINE = 0xCB, 0x90
+# gathers (noise1). A strip's frames run at LONG_LINE with the gain cut to match: the dark noise does not rise with the
+# time, so signal to noise on dense film rises almost with the light, about 2 times at 0x90 against LINE_PERIOD (noise1)
+# and 2 times again at 0x20 against 0x90 (long1, 23 lines/s, clean), for about 78 s a frame against 39 and 18. 0xE8 is
+# too fast (the stream breaks). The light saturates before the gain: open light tops out near 30000 at gain 0 and is
+# already 8 % short of proportional at 24500 (probe56), and long1's clearest film, near 20000 before the gain, bent about
+# 8 %. So each strip takes the longest line up to LONG_LINE that keeps its film base before the gain under BASE_TOP, the
+# most 0x90 gave the thinnest strips (strip_line()): dense film gets 0x20, thin film no more light than 0x90 gave it.
+LINE_PERIOD, LONG_LINE = 0xCB, 0x20
+BASE_TOP = 19200  # film base before the gain (its level at gain 0, 16-bit), at most: 0x90 on the thinnest strip seen
+# (alignment brightest 111), so no strip gets less light than 0x90 gave it
 SLIP_CLEAN, SLIP_NOISE, SLIP_LOOK = 0.8, 0.5, 8  # byte-slip repair (repair_slips): neighbouring lines of a picture or an
 # empty gate correlate above 0.9, lines after a slip around 0; SLIP_LOOK lines decide
 # Proof scans at 300 dpi (8-bit grey only): the vendor's table for 300 dpi is
@@ -1807,13 +1814,12 @@ class PF1800:
                  f"{target}")
         return code, slope
 
-    def align_gain(self, frame, exposure=1.0):
-        """The gain code for strip frames at 1800 dpi from an alignment scan of the strip (`frame`, see align_scan()): the
-        highest at which the brightest part (the film base, in the gaps) is expected under PROOF_TARGET, as proof_gain()
-        but with no extra pass. Open light past the film's end is left out (OPEN_LIGHT: after a rewind the strip's cut end
-        lies in the gate, which set roll40's gain to 6 against roll39's 14; film base reads at most 111 here, open light
-        161 and up). `exposure` is the frame scans' light against the alignment scan's line (line_exposure()). None when
-        most of the scan is open light, or in a dry run."""
+    def align_base(self, frame):
+        """(the brightest film level of an alignment scan of the strip (`frame`, see align_scan()), 8-bit at ALIGN_GAIN;
+        the film base expected at 1800 dpi at gain 0 and LINE_PERIOD). Open light past the film's end is left out
+        (OPEN_LIGHT: after a rewind the strip's cut end lies in the gate, which set roll40's gain to 6 against roll39's 14;
+        film base reads at most 111 here, open light 161 and up). None when most of the scan is open light, or in a dry
+        run."""
         import numpy as np
 
         if self.dry_run or frame is None or not frame.lines:
@@ -1823,10 +1829,31 @@ class PF1800:
         if film.size < samples.size / 2:
             return None
         level = float(np.percentile(film, 99.5))
-        unit = level * 257 * ALIGN_SCALE * exposure / grey_gain_factor(ALIGN_GAIN)  # expected 1800 dpi level per unit of gain
+        return level, level * 257 * ALIGN_SCALE / grey_gain_factor(ALIGN_GAIN)
+
+    def strip_line(self, frame, longest=LONG_LINE):
+        """The line period byte for a strip's frames from an alignment scan of it: the longest line, up to `longest`, at
+        which the film base before the gain (its gain-0 level) stays under BASE_TOP, so thin film is not pushed into the
+        bend at the top of the light's range. LINE_PERIOD when the alignment gives nothing (a dry run)."""
+        found = self.align_base(frame)
+        if found is None:
+            return LINE_PERIOD
+        exposure = min(line_exposure(longest), max(1.0, BASE_TOP / found[1]))
+        return min(LINE_PERIOD, max(longest, math.ceil(256 - exposure * (256 - LINE_PERIOD))))
+
+    def align_gain(self, frame, exposure=1.0):
+        """The gain code for strip frames at 1800 dpi from an alignment scan of the strip (`frame`, see align_scan()): the
+        highest at which the brightest part (the film base, in the gaps) is expected under PROOF_TARGET, as proof_gain()
+        but with no extra pass (align_base()). `exposure` is the frame scans' light against the alignment scan's line
+        (line_exposure()). None when most of the scan is open light, or in a dry run."""
+        found = self.align_base(frame)
+        if found is None:
+            return None
+        level, base = found
+        unit = base * exposure  # expected 1800 dpi level per unit of gain
         pick = max((c for c in range(16) if unit * grey_gain_factor(c) <= PROOF_TARGET), default=0)
         self.log(f"alignment: brightest {level:.0f} at gain {ALIGN_GAIN}; gain {pick}, {unit * grey_gain_factor(pick):.0f} "
-                 f"expected at 1800 dpi")
+                 f"expected at 1800 dpi, {unit:.0f} before the gain")
         return pick
 
     # ---- film strips --------------------------------------------------------------------------------------------------

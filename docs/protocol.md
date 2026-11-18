@@ -279,6 +279,8 @@ paces the carriage too. It is also the exposure. Measured at `BB` 5:
 | `B0` | 1.5 | 65 | 24500 | 489 |
 | `90` | 2.1 | 46 | 28700 | 491 |
 | `73` | 2.7 | 37 | 30000 | 489 |
+| `50` | 3.3 | 29 | | |
+| `20` | 4.2 | 23 | | |
 | `E8` | | | the stream breaks | |
 
 So a longer line is more light with no more dark noise, and it stops gaining in open light near 30000 at gain 0. On film, the
@@ -286,8 +288,18 @@ same frame scanned twice at each setting, `90` at gain 7 gave about twice the si
 (1.4 times at the thinnest), with no change in geometry. The gain has to come down with it: `90` at gain 10 clipped 61 % of a
 thin frame. The dark noise does fall with the gain: 524 at gain 15, 403 at gain 10, 301 at gain 7.
 
-The driver scans a strip's frames at `90` (`--line`), with the strip gain picked for that light. Open light, alignment and
-autofocus stay at `CB`. Other scans stay at `CB` too.
+Longer still, on film (long1, the same method, gain 7 unless noted): against `90`, signal to noise in dense film rose 1.27
+times at `73`, 1.56 at `50` and 1.93 at `20` (2.00 at `20` gain 4), and 1.6 times in the middle of the range at `20`. The
+dense-film noise hardly grows (311 counts at `90`, 336 at `20`), and the level stays close to the line time (`20` reads
+1.93 to 2.09 times `90`, bending a little at the thin end). `50` and `20` stream clean (1800 lines in 61 and 78 s) with no
+change in geometry. Gain 4 gives the same signal to noise as gain 7 at `20` and only stops the clipping.
+
+The light saturates before the gain: open light is already 8 % short of proportional at 24500 (gain 0) and tops out near
+30000, and the clearest film of long1, near 20000 before the gain at `20`, bent about 8 %. Lowering the gain does not help
+there. So the driver picks each strip's line from its first alignment scan: the longest, up to `20` (`--line`), that keeps
+the film base under 19200 before the gain, which is what `90` gave the thinnest strip seen. Dense film gets `20`, thin
+film never less light than `90` gave it, and the gain is then picked for that line (it comes out at 4). Open light,
+alignment and autofocus stay at `CB`. Other scans stay at `CB` too.
 
 ### Front end levels
 

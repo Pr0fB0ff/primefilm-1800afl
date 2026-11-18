@@ -197,11 +197,12 @@ class RollSession:
         scanner, opts, step = self.scanner, self.opts, self.step
         plain = opts.grey and not opts.proof and self.calibration is None and step == 1
         if plain and opts.gains is None:
-            code = scanner.align_gain(align, line_exposure(opts.line))
+            line = scanner.strip_line(align, opts.line)  # the longest line the film base takes, up to opts.line
+            code = scanner.align_gain(align, line_exposure(line))
             if code is not None:
-                self.log(f"strip gain {code} from the first alignment (open light gave {self.gains[0]})")
+                self.log(f"strip gain {code}, line {line:#x}, from the first alignment (open light gave {self.gains[0]})")
                 self.gains = (code,) * 3
-                self.frame_line = opts.line
+                self.frame_line = line
         if plain and opts.depth == 16 and opts.offsets is None:
             found = scanner.black_offset(self.gains, ALIGN_SCAN[1])
             if found is not None:
@@ -381,8 +382,10 @@ def main(argv=None):
                     help="AFE gains R,G,B (each 0..15; default: picked from open light, or per --depth with --rgb)")
     ap.add_argument("--offsets", type=triple, default=None, help="AFE offsets R,G,B (default per --depth)")
     ap.add_argument("--line", type=lambda v: int(v, 0), default=LONG_LINE, metavar="BYTE",
-                    help=f"strip: the frames' line period byte, 0x73 to {LINE_PERIOD:#x}: lower gathers more light and is "
-                         f"slower, the gain picked to match (default {LONG_LINE:#x}, about twice the light and the time)")
+                    help=f"strip: the longest line period byte for the frames, 0x20 to {LINE_PERIOD:#x}: lower gathers "
+                         f"more light and is slower; each strip takes the longest its film base allows, up to this, "
+                         f"with the gain picked to match (default {LONG_LINE:#x}, up to about 4 times the light and the "
+                         f"time)")
     ap.add_argument("--no-falloff", action="store_true",
                     help="strip: do not flatten the light along the CCD (about 5 to 12 %% at the frame's ends)")
     ap.add_argument("--warmup", type=float, default=10.0,
