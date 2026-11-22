@@ -312,7 +312,7 @@ Gains are 4-bit codes (`28 29 2A`) and offsets 8-bit (`20 21 22`). A lower offse
 
 Colour film needs its own gains: these are chosen for black-and-white film and for slides.
 
-Relative level by gain code, 16-bit mono: 0: 1.0, 2: 2.14, 4: 2.9, 8: 4.5, 15: 6.3. At gain 15 the offset moves the black level about
+Relative level by gain code, 16-bit mono: 0: 1.0, 2: 2.06, 4: 2.9, 8: 4.5, 15: 6.3. At gain 15 the offset moves the black level about
 165 counts per code, and at the fixed offsets the black level sat at or below 0 and drifted down along a roll. Choosing the
 offset for a black level around 6000 and subtracting it from the frame stops the negative's densest parts from reading 0.
 
@@ -511,6 +511,17 @@ None of this is protocol, but a driver will want it. Each is the host's job, sin
   light before the first two frames and then every third, take the trend for the frames between, and scale each frame to frame 1. Seek home before each
   reading: the tracked position drifts over a long run.
 - **Falloff along the CCD**: about 0.95 of the middle at a frame's left end and 0.88 at its right.
+- **The response bends before the gain.** A stepped wedge scanned at four line periods (0xCB to 0x9F) and gains 4 to 11 puts every
+  step on one curve of the level before the gain, L (the count less the black level, over the gain's factor): reading = light x
+  (1 - (L / 53200) ^ 1.78), 98.5 % of proportional at 5000, 94.5 % at 10500, 84 % at 19200, 75 % at 24500. The gain after it is
+  linear within 1 %, and the line period only sets the light (once the curve is undone, the line time is proportional to 256 minus
+  the byte within 2 %). Open light at gain 0 agrees within about 5 % up to 28700, then stops at a hard ceiling near 30000. So a strip
+  at a long line, whose clear film sits near 19000 before the gain, reads its thinnest tones compressed (about 5 % of its density
+  scale) unless each pixel is divided by the curve at its own L; `Frame.linear` does that, held at the value for L 26000 above it,
+  and a strip's gain is picked for the lifted film base.
+  Checked on the unit by the same wedge at 0xCB (gain 10) and 0x9F (gain 2), each step against a dim one: before, the clear patch at
+  0x9F read 0.886 of its 0xCB ratio and the thin steps 0.92 to 0.99; made linear, every step reads 0.99 to 1.01 (vtt7, vtt8). That
+  needed gain 2's factor measured directly (2.06; a wedge at gains 2 and 4 at one line), since the level before the gain comes from it.
 
 ## Not known
 

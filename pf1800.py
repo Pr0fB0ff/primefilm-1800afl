@@ -75,12 +75,21 @@ GREY_BB = 5  # 0xBB for 16-bit grey; 0xC8 is GREY_BB + 1, as the vendor pairs th
 # time, so signal to noise on dense film rises almost with the light, about 2 times at 0x90 against LINE_PERIOD (noise1)
 # and 2 times again at 0x20 against 0x90 (long1, 23 lines/s, clean), for about 78 s a frame against 39 and 18. 0xE8 is
 # too fast (the stream breaks). The light saturates before the gain: open light tops out near 30000 at gain 0 and is
-# already 8 % short of proportional at 24500 (probe56), and long1's clearest film, near 20000 before the gain, bent about
-# 8 %. So each strip takes the longest line up to LONG_LINE that keeps its film base before the gain under BASE_TOP, the
+# already 8 % short at 24500 of proportional to its reading at LINE_PERIOD (probe56), which bends too (RESPONSE_K below),
+# and long1's clearest film, near 20000 before the gain, bent about 8 %. So each strip takes the longest line up to LONG_LINE that keeps its film base before the gain under BASE_TOP, the
 # most 0x90 gave the thinnest strips (strip_line()): dense film gets 0x20, thin film no more light than 0x90 gave it.
 LINE_PERIOD, LONG_LINE = 0xCB, 0x20
 BASE_TOP = 19200  # film base before the gain (its level at gain 0, 16-bit), at most: 0x90 on the thinnest strip seen
 # (alignment brightest 111), so no strip gets less light than 0x90 gave it
+# The bend is a function of the level before the gain, whatever the line: a stepped wedge scanned at four lines (0xCB to
+# 0x9F, gains 4 to 11; vtt2 to vtt6) puts every step on one curve, reading = light x response(L), L the reading before the
+# gain (the count less the black level, over grey_gain_factor()), with response(L) = 1 - (L / RESPONSE_K) ^ RESPONSE_P (rms
+# 0.36 %): 98.5 % of proportional at 5000, 94.5 % at 10500, 84 % at BASE_TOP, 75 % at 24500. The gain after it is linear
+# within 1 % (gains 4 and 11 at one line). With the curve undone the four lines' exposures come out within 2 % of
+# line_exposure(), and open light at gain 0 against the line agrees within about 5 % to 28700 (0x90); past that it stops
+# at a hard ceiling near 30000 that the curve does not follow, so the correction is held at its value at RESPONSE_TOP.
+# Frame.linear undoes it per pixel (aligned()).
+RESPONSE_K, RESPONSE_P, RESPONSE_TOP = 53200.0, 1.78, 26000.0
 SLIP_CLEAN, SLIP_NOISE, SLIP_LOOK = 0.8, 0.5, 8  # byte-slip repair (repair_slips): neighbouring lines of a picture or an
 # empty gate correlate above 0.9, lines after a slip around 0; SLIP_LOOK lines decide
 # Proof scans at 300 dpi (8-bit grey only): the vendor's table for 300 dpi is
@@ -134,9 +143,11 @@ LAMP_EVERY, LAMP_SETTLE, LAMP_MOST = 20.0, 0.003, 360.0
 GREY_CHANNEL = 0  # the colour the mono front end samples (0 red, 1 green, 2 blue). Red, as the alignment scan and the
 # autofocus metric read: red and green focus several lens units apart, so a green frame was scanned off focus (probe51).
 # Green would read 1.11 times as much at the same gain; the vendor's default mono channel is green
-GREY_GAIN_STEPS = ((0, 1.0), (2, 2.14), (4, 2.9), (8, 4.5), (15, 6.3))  # front-end gain code -> relative level (probe49
-# --gain; code 2 from seven strip frames scanned at 15 seconds after their proof at 2: 2.94 times the level, not the 3.23
-# a straight line from 0 to 4 gave, which had every frame land 6 to 10 % under its prediction)
+GREY_GAIN_STEPS = ((0, 1.0), (2, 2.06), (4, 2.9), (8, 4.5), (15, 6.3))  # front-end gain code -> relative level (probe49
+# --gain; code 2 first from seven strip frames scanned at 15 seconds after their proof at 2, 2.14, then measured directly:
+# a wedge scanned at gains 2 and 4 at one line (vtt8, vtt2) reads 0.711 as much at 2 once the lamp is allowed for, 2.06;
+# gain 10 against 4 the same way (vtt7, vtt4) reads within 1.3 % of the table. Frame.linear finds each pixel's level
+# before the gain through this table, so an error here moves where the response curve is read)
 GREY_TARGET = 46000  # grey scans: open light in the lit calibration window is kept under this; the open gate reads about
 # 1.25 times brighter (roll17), so an empty gate or clear film stays under full scale with a little margin for the lamp
 
@@ -323,6 +334,9 @@ class Frame:
         self.black = 0  # 16-bit grey: subtracted from every sample by aligned() (the measured black level, see BLACK_TARGET)
         self.scale = 1.0  # 16-bit grey: aligned() then multiplies by this (the lamp sag correction, see OPEN_PERCENTILE)
         self.flat = None  # 16-bit grey: and by this, one value per column (the falloff correction, see falloff_gain())
+        # 16-bit grey: the front end's gain factor (grey_gain_factor()) the frame was read at; when set, aligned() undoes the
+        # response's bend after taking off the black level and before the scale (see RESPONSE_K, linear_gain())
+        self.linear = None
 
     def _samples(self, line):
         return array("H", line) if self.depth == 16 else line
@@ -335,15 +349,17 @@ class Frame:
             if self.step > 1:  # a proof scan starts at LEFT: no counter pixel to drop
                 return [self._samples(line)[::-1] for line in self.lines]
             rows = [self._samples(line)[::-1][:WIDTH] for line in self.lines]
-            if self.depth == 16 and (self.black or self.scale != 1.0 or self.flat is not None):
+            if self.depth == 16 and (self.black or self.scale != 1.0 or self.flat is not None or self.linear):
                 import numpy as np
 
                 black = np.uint16(min(int(self.black), 65535))
                 out = []
                 for r in rows:
                     v = np.maximum(np.frombuffer(r.tobytes(), "<u2"), black) - black
-                    if self.scale != 1.0 or self.flat is not None:
+                    if self.scale != 1.0 or self.flat is not None or self.linear:
                         gain = self.scale if self.flat is None else self.scale * self.flat
+                        if self.linear:
+                            gain = gain * linear_gain(v / self.linear)
                         v = np.minimum(np.rint(v * gain), 65535).astype(np.uint16)
                     out.append(array("H", v.tobytes()))
                 rows = out
@@ -581,6 +597,14 @@ def falloff_gain(columns):
     gain = np.ones(len(columns))
     gain[lo:hi] = np.minimum(np.median(columns[lo:hi]) / level, FALLOFF_MOST)
     return gain
+
+
+def linear_gain(level):
+    """What undoes the response's bend at `level`, the reading before the gain (a number or a numpy array): 1 over
+    1 - (level / RESPONSE_K) ^ RESPONSE_P, held at its RESPONSE_TOP value above that."""
+    import numpy as np
+
+    return 1.0 / (1.0 - (np.clip(level, 0.0, RESPONSE_TOP) / RESPONSE_K) ** RESPONSE_P)
 
 
 def grey_gain_factor(code):
@@ -1764,16 +1788,18 @@ class PF1800:
         scan."""
         return self.scan(lines, approach, (PROOF_GAIN,) * 3, None, 0.0, depth=8, grey=True, step=PROOF_STEP)
 
-    def proof_gain(self, proof):
+    def proof_gain(self, proof, linear=False):
         """The gain code for the frame `proof` at 1800 dpi: the highest at which the frame's brightest part (the 99.5th
-        percentile, which the proof's sideways row jumps do not change) is expected under PROOF_TARGET."""
+        percentile, which the proof's sideways row jumps do not change) is expected under PROOF_TARGET; with `linear`,
+        once made linear (as align_gain())."""
         import numpy as np
 
         base = float(np.percentile(np.frombuffer(b"".join(proof.aligned()), "u1"), 99.5)) * 257
         unit = base * PROOF_SCALE / grey_gain_factor(PROOF_GAIN)  # the expected 1800 dpi level per unit of gain factor
+        unit *= float(linear_gain(unit)) if linear else 1.0
         pick = max((c for c in range(16) if unit * grey_gain_factor(c) <= PROOF_TARGET), default=0)
         self.log(f"proof: brightest {base:.0f} at gain {PROOF_GAIN}; gain {pick}, {unit * grey_gain_factor(pick):.0f} "
-                 f"expected at 1800 dpi")
+                 f"expected at 1800 dpi{' when made linear' if linear else ''}")
         return pick
 
     def frame_black(self, frame):
@@ -1868,19 +1894,23 @@ class PF1800:
         exposure = min(line_exposure(longest), max(1.0, BASE_TOP / found[1]))
         return min(LINE_PERIOD, max(longest, math.ceil(256 - exposure * (256 - LINE_PERIOD))))
 
-    def align_gain(self, frame, exposure=1.0):
+    def align_gain(self, frame, exposure=1.0, linear=False):
         """The gain code for strip frames at 1800 dpi from an alignment scan of the strip (`frame`, see align_scan()): the
         highest at which the brightest part (the film base, in the gaps) is expected under PROOF_TARGET, as proof_gain()
         but with no extra pass (align_base()). `exposure` is the frame scans' light against the alignment scan's line
-        (line_exposure()). None when most of the scan is open light, or in a dry run."""
+        (line_exposure()). With `linear` the frames will be made linear (Frame.linear), which lifts the film base by
+        linear_gain() of its level before the gain, so the gain is picked for the lifted level. None when most of the scan
+        is open light, or in a dry run."""
         found = self.align_base(frame)
         if found is None:
             return None
         level, base = found
         unit = base * exposure  # expected 1800 dpi level per unit of gain
-        pick = max((c for c in range(16) if unit * grey_gain_factor(c) <= PROOF_TARGET), default=0)
-        self.log(f"alignment: brightest {level:.0f} at gain {ALIGN_GAIN}; gain {pick}, {unit * grey_gain_factor(pick):.0f} "
-                 f"expected at 1800 dpi, {unit:.0f} before the gain")
+        lift = float(linear_gain(unit)) if linear else 1.0  # Frame.linear raises the film base by this
+        pick = max((c for c in range(16) if unit * lift * grey_gain_factor(c) <= PROOF_TARGET), default=0)
+        self.log(f"alignment: brightest {level:.0f} at gain {ALIGN_GAIN}; gain {pick}, "
+                 f"{unit * lift * grey_gain_factor(pick):.0f} expected at 1800 dpi"
+                 f"{f' when made linear (x{lift:.3f})' if linear else ''}, {unit:.0f} before the gain")
         return pick
 
     # ---- film strips --------------------------------------------------------------------------------------------------

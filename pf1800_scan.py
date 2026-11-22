@@ -19,6 +19,9 @@ blue on negatives. --colour reads as --rgb does but keeps the three channels (RG
 front-end levels unless --gains: no gain is picked for colour film yet, and nothing is done about a colour negative's
 orange mask.
 
+Grey frames are made proportional to the light (the response bends at high levels before the gain; --no-linear leaves
+it in).
+
 Writes <prefix>_raw.bin (the lines exactly as read: red samples, or all three colours with --rgb or --colour),
 <prefix>.tif (greyscale, or RGB with --colour; full resolution, mirrored, 16 or 8 bits per sample, 1800 dpi) and
 <prefix>_preview.png (contrast-stretched, 8 bits).
@@ -42,7 +45,7 @@ from pathlib import Path
 
 from pf1800 import (ALIGN_SCAN, BLACK_TARGET, CAL_DARK_AT, CAL_LINES, DEFAULT_LEVELS, FRAME_SCAN, LINE_PERIOD, LONG_LINE,
                     PF1800, RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns,
-                    is_empty_gate, is_leader, is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
+                    grey_gain_factor, is_empty_gate, is_leader, is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
 
 # Autofocus sweep (start, step, count, in lens units from home) for a strip: the feeder holds a strip near focus at +0 to
 # +3 (a slide's emulsion is at +40, so it keeps autofocus()'s full 0 to 75), so 0 to 15 is usually enough and follows curl.
@@ -106,6 +109,8 @@ class ScanOptions:
     predict: bool = True  # strip: advance to the edge the frame pitch predicts and check it with a short scan, not an alignment
     falloff: bool = True  # strip, with sag: flatten the light along the CCD from the first reading (pf1800.falloff_gain())
     settle: bool = True  # grey: warm the lamp until its open light is steady (pf1800.LAMP_SETTLE), `warmup` at least
+    linear: bool = True  # grey at 1800 dpi, no flat-field: undo the response's bend at high levels (pf1800.RESPONSE_K,
+    # Frame.linear), and pick a strip's or proof's gain for the lifted level
 
     @property
     def step(self):
@@ -125,6 +130,12 @@ class ScanOptions:
             raise ValueError("proof is for strips")
         if self.proof and self.gains is not None:
             raise ValueError("proof sets the gain itself; leave out the gains")
+
+    @property
+    def made_linear(self):
+        """Whether frames are made linear (Frame.linear): grey at 1800 dpi, `linear` on and no flat-field correction (the
+        calibration is taken at the scan's own levels and maps them to its references, bend and all)."""
+        return self.linear and self.grey and self.step == 1 and not self.flatfield
 
 
 MONITOR_REST = (0, 0.5, 1, 2, 4, 8)  # --monitor-rest: minutes after the lamp is relit at which to read
@@ -198,7 +209,7 @@ class RollSession:
         plain = opts.grey and not opts.proof and self.calibration is None and step == 1
         if plain and opts.gains is None:
             line = scanner.strip_line(align, opts.line)  # the longest line the film base takes, up to opts.line
-            code = scanner.align_gain(align, line_exposure(line))
+            code = scanner.align_gain(align, line_exposure(line), linear=opts.made_linear)
             if code is not None:
                 self.log(f"strip gain {code}, line {line:#x}, from the first alignment (open light gave {self.gains[0]})")
                 self.gains = (code,) * 3
@@ -227,7 +238,7 @@ class RollSession:
             if shot.lines:
                 if self.on_frame:
                     self.on_frame(n, shot, "proof", None)
-                use = (scanner.proof_gain(shot),) * 3
+                use = (scanner.proof_gain(shot, linear=opts.made_linear),) * 3
                 log(f"frame gain {use[0]} (roll gain {self.gains[0]})")
             warmup = 0.0
         if sag["on"]:  # open light now, against frame 1's: the frame (and a rescan of it) is scaled back to that level
@@ -270,6 +281,8 @@ class RollSession:
                         black["offsets"] = (new, *rest)
             if sag["on"] and frame.lines:
                 frame.scale, frame.flat = sag["scale"], sag["flat"]
+            if opts.made_linear and frame.lines and use is not None:  # the bend is undone at the level before the gain
+                frame.linear = grey_gain_factor(use[0])
             return frame
 
         frame = full_scan(warmup)
@@ -379,7 +392,9 @@ def main(argv=None):
                     help="strip: scan each frame at 300 dpi first and set its 1800 dpi gain from it (grey only)")
     ap.add_argument("--approach", type=int, default=1550, help="steps past the reference edge where the scan starts")
     ap.add_argument("--gains", type=triple, default=None,
-                    help="AFE gains R,G,B (each 0..15; default: picked from open light, or per --depth with --rgb)")
+                    help="AFE gains R,G,B (each 0..15; default: picked from open light, or per --depth with --rgb). Grey "
+                         "frames are then made linear at these gains, which lifts clear film by up to about 1.2 times "
+                         "and may clip it (the picked gains allow for that; --no-linear does not lift)")
     ap.add_argument("--offsets", type=triple, default=None, help="AFE offsets R,G,B (default per --depth)")
     ap.add_argument("--line", type=lambda v: int(v, 0), default=LONG_LINE, metavar="BYTE",
                     help=f"strip: the longest line period byte for the frames, 0x20 to {LINE_PERIOD:#x}: lower gathers "
@@ -388,6 +403,10 @@ def main(argv=None):
                          f"time)")
     ap.add_argument("--no-falloff", action="store_true",
                     help="strip: do not flatten the light along the CCD (about 5 to 12 %% at the frame's ends)")
+    ap.add_argument("--no-linear", action="store_true",
+                    help="grey: leave the response's bend in: by default each pixel is made proportional to the light "
+                         "from its level before the gain (a film base at the longest lines reads about 16 %% short "
+                         "otherwise, and densities about 5 %% compressed in the thinnest tones)")
     ap.add_argument("--warmup", type=float, default=10.0,
                     help="lamp warm-up in seconds (grey: at least this, then until open light is steady; see --no-settle)")
     ap.add_argument("--no-settle", action="store_true",
@@ -432,7 +451,8 @@ def main(argv=None):
                        colour=args.colour, gains=args.gains, offsets=args.offsets, warmup=args.warmup,
                        autofocus=args.autofocus, focus=args.focus, flatfield=args.flatfield, proof=args.proof,
                        sag=not args.no_sag, sag_every=max(1, args.sag_every), predict=not args.no_predict, line=args.line,
-                       falloff=not args.no_falloff, settle=not args.no_settle)
+                       falloff=not args.no_falloff, settle=not args.no_settle,
+                       linear=not args.no_linear)
     try:
         opts.check()
     except ValueError as e:
