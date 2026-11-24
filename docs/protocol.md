@@ -422,7 +422,10 @@ Three behaviours shape everything else:
    every pitch. Only a coarse unit is sure to pass, and waiting, command 7 or one fine unit back do not help. A coarse unit is about 40 px short of a
    pitch, so it moves the holes back up the pitch: with holes that would lie in the band, a target has no route that avoids a fine feed across it.
    Once stalls have placed the band, a hole read warns of a stall before it happens. The last frames may need a coarse unit, with whatever
-   overshoot it brings.
+   overshoot it brings. A camera advances 8 perforations a frame (38 mm), so a frame edge's place against the holes repeats along a strip;
+   where it lies behind the stop (stuck1: a band about 150 px wide), no frame of that strip can be placed exactly, and every retry ends at the
+   stop again. So once two stalls since an advance stop within 25 px of each other against the holes, the driver scans that strip's frames
+   where they lie, without putting a frame in place again after its scan, until a frame is placed with no stall.
 3. **Hole reads are exact only modulo the pitch.** Expect under half a pitch per round of fine units (about 7 units), or a stall reads as a
    whole perforation.
 

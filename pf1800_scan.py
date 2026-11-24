@@ -292,9 +292,9 @@ class RollSession:
         frame = full_scan(warmup)
         # the frame scan sees every picture row, the alignment only some: when it shows the frame lying too far in (pale
         # picture beside a gap fooled the alignment) or fed too far (its left end lost), put the frame's edge in place and
-        # scan it again, once
+        # scan it again, once; not on a strip whose fine units stop at one place (stuck_strip), where it cannot do better
         off = None
-        if opts.strip and kind == "frame" and place:
+        if opts.strip and kind == "frame" and place and not getattr(scanner, "stuck_strip", False):
             off = scanner.late_frame(frame)
             off = scanner.early_frame(frame) if off is None else off
         if off is not None:

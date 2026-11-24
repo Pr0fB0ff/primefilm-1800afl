@@ -225,6 +225,11 @@ OVER_OK, BACK_TO, BACK_MAX, BACK_TIMES = 20, 400, 4, 2  # a frame edge more than
 # coarse units back until the edge is BACK_TO into the gate (at most BACK_MAX), one coarse unit forward to take up the
 # reversal slack and re-engage the fine drive, then fine feeds (probe53: from -150 back 264 + 311, forward 265, fine 120,
 # ending at 38 to 42 every time; fine units alone hardly move after a reversal, probe52)
+SAME_STALL = 25  # two fine stalls since the last advance with the first hole within this mod the pitch are the same stop:
+# the strip is then `stuck_strip` and its frames are scanned where they lie, without the rescan placement (stuck1: on a strip
+# whose frame edges fall behind the stop, every retry ended there again; its repeats were 0.5 to 20 px apart). A camera
+# advances 8 perforations a frame, so the place repeats along the strip; a placement with no stall clears it. In the roll
+# simulation about a third less time on such a strip, and about 1 frame in 17 more a little out of the gate where retries pass
 CHECK_AGREE = 60  # a check scan more than this from the hole reads' measure is not believed: the holes measure the film to a
 # few pixels, a check scan can be fooled both ways (roll36e frame 22: a pale wall read 45 where the holes said -213, so no
 # back-off and the frame lost 650 px; the roll simulation: 30 read as -24, a needless back-off)
@@ -1107,6 +1112,12 @@ def is_leader(r):
     return bool((level < LEADER_DARK).all())
 
 
+def _phase_gap(a, b):
+    """The distance between two places mod PERF_PITCH."""
+    d = abs(a - b) % PERF_PITCH
+    return min(d, PERF_PITCH - d)
+
+
 class EndOfFilm(ScannerError):
     pass
 
@@ -1145,6 +1156,8 @@ class PF1800:
         self.start_lead = 0.0  # coarse units the strip lies in from where the auto-load holds it, while page B bit 6 is
         # clear (see _back_stop()); 0 when not known, which allows nothing back there
         self._b6 = None  # page B bit 6 at the last read by _start_state(), None before one
+        self.stalls = []  # first hole mod PERF_PITCH at each fine stall since the last advance_frame()
+        self.stuck_strip = False  # fine stalls repeat at one place: frames are scanned where they lie (SAME_STALL)
         self.cancelled = None  # a callable polled between feed units and between a scan's transfers; True raises Cancelled
 
     def _poll_cancel(self, what="placing the frame"):
@@ -2043,6 +2056,7 @@ class PF1800:
             if -d < FINE_STALL * n * FINE_PX:
                 remaining = px - moved
                 self.log(f"fine units stalled ({-d:.0f} px for {n} units), {remaining:.0f} px short")
+                self._note_stall(last)
                 if over_ok is not None and short_ok is not None:
                     lost_short = max(0.0, remaining - short_ok)
                     lost_over = max(0.0, COARSE_PX - remaining - over_ok)
@@ -2053,6 +2067,17 @@ class PF1800:
                 break
         self.log(f"fed {moved:.0f} of {px:.0f} px")
         return moved
+
+    def _note_stall(self, holes):
+        """Record a fine stall at hole read `holes`; a second at the same place since the last advance (SAME_STALL) marks
+        the strip stuck."""
+        if not holes:
+            return
+        at = holes[0] % PERF_PITCH
+        if not self.stuck_strip and any(_phase_gap(at, s) <= SAME_STALL for s in self.stalls):
+            self.log(f"the fine units stopped at {at:.0f} mod the pitch again: frames are scanned where they lie")
+            self.stuck_strip = True
+        self.stalls.append(at)
 
     def align_scan(self, warmup=0.0, grey=ALIGN_GREY, lines=ALIGN_SCAN[0]):
         """The scan the frame alignment looks at (ALIGN_SCAN, or its first `lines`): 8-bit colour, or 8-bit grey of
@@ -2102,6 +2127,7 @@ class PF1800:
         can be fooled, the holes measure the film (probe52/53: to 1 to 3 px). Where a check scan cannot tell, the holes'
         measure stands. Returns where the edge ends up, None when neither can tell (a dry run)."""
         at, holes, fits, backed = edge, edge, GATE_END - FRAME_PX - edge_at, 0
+        stalled = len(self.stalls)
         for n in range(ALIGN_FEEDS + BACK_TIMES):
             if at is None:
                 break
@@ -2121,6 +2147,9 @@ class PF1800:
                 self.log(f"check scan ({seen}) and hole reads ({holes}) disagree; going by the holes")
                 seen = None
             at = seen if seen is not None else (None if moved is None else holes)
+        if len(self.stalls) == stalled and self.stuck_strip:
+            self.log("placed with no stall: frames are put in place again after their scan")
+            self.stuck_strip = False
         self.placed, self.jogged = at, 0.0
         return at
 
@@ -2220,6 +2249,7 @@ class PF1800:
         pixel `upto` (next_frame_edge()), then align."""
         self.failed_align = None
         self._poll_cancel()
+        self.stalls = []
         edge = None if frame is None else self.predict_edge(frame, pitch_mm)
         if edge is not None:
             at = self._advance_predicted(edge)
