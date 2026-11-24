@@ -1111,6 +1111,10 @@ class EndOfFilm(ScannerError):
     pass
 
 
+class Cancelled(ScannerError):
+    """The caller's `PF1800.cancelled()` asked to stop: a feed or a scan was broken off, and the film lies where it is."""
+
+
 class MCUTimeout(ScannerError):
     pass
 
@@ -1141,6 +1145,32 @@ class PF1800:
         self.start_lead = 0.0  # coarse units the strip lies in from where the auto-load holds it, while page B bit 6 is
         # clear (see _back_stop()); 0 when not known, which allows nothing back there
         self._b6 = None  # page B bit 6 at the last read by _start_state(), None before one
+        self.cancelled = None  # a callable polled between feed units and between a scan's transfers; True raises Cancelled
+
+    def _poll_cancel(self, what="placing the frame"):
+        """Raise Cancelled when `cancelled()` says so. Called only between whole feed units, scans and bulk transfers, so
+        the MCU is never left mid-command."""
+        if self.cancelled is not None and self.cancelled():
+            raise Cancelled(f"stopped while {what}")
+
+    def _sleep(self, seconds, what):
+        """time.sleep(), polling cancelled() every quarter second."""
+        end = time.time() + seconds
+        while (left := end - time.time()) > 0:
+            self._poll_cancel(what)
+            time.sleep(min(0.25, left))
+
+    def _break_scan(self, lines_read, approach, step):
+        """Stop a scan's stream part way (Cancelled): motor and auto scan off, the buffer cleared, and the stream start sent
+        again before the next one. The carriage is past the approach by at least the lines read (the buffer lags the motor),
+        so the position kept is that lower bound: what follows is a seek home (eject(), park()), safe from anywhere past
+        the home zone."""
+        try:
+            self.stop_motor()
+        finally:
+            self.safe_initial_chip()  # StopAutoScan, then the buffer cleared
+            self.tr.stream_started = False
+            self.position = approach + lines_read * step
 
     # ---- session -----------------------------------------------------------------------------------------------------
 
@@ -1704,7 +1734,8 @@ class PF1800:
             raise ScannerError(f"the scan would end at {approach + lines * step + 2} steps, beyond {MAX_POSITION}")
         self.lamp(True)
         if not self.dry_run:
-            time.sleep(warmup)
+            self._sleep(warmup, "warming the lamp")
+        self._poll_cancel("starting a scan")
         if self.position is None:
             self.reference()
         if self.focus is not None and getattr(self, "_lens_at", None) != self.focus:
@@ -1717,6 +1748,9 @@ class PF1800:
         sizes = 0
         t0 = time.time()
         while len(stream) < lines * line_bytes:
+            if self.cancelled is not None and self.cancelled():
+                self._break_scan(len(stream) // line_bytes, approach, step)
+                raise Cancelled(f"stopped during a scan, {len(stream) // line_bytes} of {lines} lines in")
             chunk = self.tr.stream_chunk(line_bytes if step > 1 else CHUNK)  # the vendor reads one line per transfer
             if chunk is None:
                 break
@@ -1821,10 +1855,10 @@ class PF1800:
         if self.dry_run:
             return None
         t0 = time.time()
-        time.sleep(least)
+        self._sleep(least, "warming the lamp")
         level = self.open_level()
         while level and time.time() - t0 < LAMP_MOST:
-            time.sleep(LAMP_EVERY)
+            self._sleep(LAMP_EVERY, "warming the lamp")
             new = self.open_level()
             self.log(f"lamp warming: open light {new:.0f} after {time.time() - t0:.0f} s")
             if not new or new < level * (1 + LAMP_SETTLE):
@@ -1987,6 +2021,7 @@ class PF1800:
             return None
         moved, units = 0.0, 0
         while px - moved > COARSE_LEFT:
+            self._poll_cancel()
             k = 2 if px - moved - COARSE_PX > COARSE_LEFT else 1
             units += k
             if units > 12:
@@ -1999,6 +2034,7 @@ class PF1800:
             remaining = px - moved
             if remaining <= tolerance:
                 break
+            self._poll_cancel()
             n = max(1, min(FINE_MAX, round(remaining / FINE_PX)))
             for _ in range(n):
                 self._feed((1,))
@@ -2069,6 +2105,7 @@ class PF1800:
         for n in range(ALIGN_FEEDS + BACK_TIMES):
             if at is None:
                 break
+            self._poll_cancel()
             if at < -OVER_OK and holes < -OVER_OK and backed < BACK_TIMES and not self.dry_run:
                 at = holes = self._back_off(holes)
                 backed += 1
@@ -2182,6 +2219,7 @@ class PF1800:
         an overshoot cannot skip the gap), or less when the last frame scan showed the next frame's edge already at CCD
         pixel `upto` (next_frame_edge()), then align."""
         self.failed_align = None
+        self._poll_cancel()
         edge = None if frame is None else self.predict_edge(frame, pitch_mm)
         if edge is not None:
             at = self._advance_predicted(edge)

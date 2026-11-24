@@ -459,6 +459,14 @@ Then a whole roll runs as:
    next frame's edge, and align again in full. A strip with uneven spacing takes the full alignment more often.
 6. Stop at the end (below).
 
+### Stopping part way
+
+A scan can be broken off between bulk transfers: stop the motor (mode 3), then StopAutoScan (the registers the scan set back to 0) and clear the
+buffer, and send the stream-start sequence again before the next scan. The buffer lags the motor, so the carriage is at least as far out as the
+lines read; the seek home that follows is safe from anywhere past the home zone. Feeds are only ever stopped between whole units, so the MCU is
+never left mid-command. The driver's `cancelled()` hook does this, and `scan_frames()` then ejects the strip from wherever it lies, keeping the
+frames finished before the stop.
+
 ### The end of a strip
 
 The vendor stops when page B bit 7 clears, which loses the last frame. Page B bits 7 **and** 6 both clear is the real end. An alignment

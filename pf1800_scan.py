@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pf1800 import (ALIGN_SCAN, BLACK_TARGET, CAL_DARK_AT, CAL_LINES, DEFAULT_LEVELS, FRAME_SCAN, LINE_PERIOD, LONG_LINE,
-                    PF1800, RESCAN_LOSS, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns,
+                    PF1800, RESCAN_LOSS, Cancelled, EndOfFilm, Frame, ScannerError, align_plane, falloff_gain, frame_columns,
                     grey_gain_factor, is_empty_gate, is_leader, is_open_light, line_exposure, png_bytes, stretch, tiff_bytes)
 
 # Autofocus sweep (start, step, count, in lens units from home) for a strip: the feeder holds a strip near focus at +0 to
@@ -178,6 +178,7 @@ class RollSession:
         self.lines, self.approach = FRAME_SCAN if opts.strip else (opts.lines or 1800 // self.step, opts.approach)
         self.gains, self.warmup = opts.gains, opts.warmup  # warmup: what is left of it for the next scan
         self.calibration = None
+        self.done = 0  # frames (not proofs) handed to on_frame
         self.frame_line = LINE_PERIOD  # the frame scans' line period: a strip's, once its gain is picked for it
         self.black = {"offsets": None, "slope": None}  # the red offset kept at BLACK_TARGET (strips, see pf1800.black_offset())
         # open light at frame 1, this frame's scale (pf1800.OPEN_PERCENTILE), and the falloff gain from frame 1's reading
@@ -299,7 +300,11 @@ class RollSession:
         if off is not None:
             where = "too far in" if off > 0 else "fed too far"
             log(f"frame {n} lies {where} (its left edge at {off}); putting it in place and scanning it again")
-            at = scanner.place_edge(off)
+            try:
+                at = scanner.place_edge(off)
+            except Cancelled:  # stopped: the first scan is the frame
+                log(f"frame {n}: stopped while putting it in place; keeping the first scan")
+                at = off
             if at is not None and abs(at - off) < RESCAN_LOSS:
                 log(f"frame {n}: the film did not move (edge at {at}); keeping the first scan")
             else:
@@ -310,6 +315,7 @@ class RollSession:
                 frame = self.calibration.apply(frame)
             if self.on_frame:
                 self.on_frame(n, frame, kind, self.calibration)
+            self.done += 1
             return frame
         return None
 
@@ -322,20 +328,39 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
     "unaligned" (no frame edge was found: whatever was in the gate) or "proof" (the 300 dpi look that set the gain), and
     calibration is the flat-field reference applied to it, or None. on_align(n, frame, failed) gets each alignment scan.
     before_scan() runs right before every stream starts, so the caller can finish work that would compete with the USB
-    transfer for the CPU. progress(fraction) is passed on to the scan, cancelled() is polled between frames (a frame
-    under way is finished). between(n), if given, runs on a strip before frame 1 (n 0) and after each frame scan, with
-    the film where it is (--monitor). Ejects the strip at the end if opts.eject. Returns the number of frames scanned."""
+    transfer for the CPU. progress(fraction) is passed on to the scan. cancelled() is polled throughout (between the
+    feed units, and between the transfers of every scan, a frame scan's included): when it says so the scan under way is
+    broken off and dropped, and a strip is ejected if opts.eject, from wherever it lies; the frames finished before it
+    are kept. between(n), if given, runs on a strip before frame 1 (n 0) and after each frame scan, with the film where
+    it is (--monitor). Ejects the strip at the end if opts.eject. Returns the number of frames scanned."""
     roll = RollSession(scanner, opts, on_frame, progress, before_scan, log)
-    roll.prepare()
 
     def aligned(n, failed=False):  # every alignment scan is kept, to check later how each frame was placed
         frame = scanner.failed_align if failed else getattr(scanner, "last_align", None)
         if on_align and frame is not None and frame.lines:
             on_align(n, frame, failed)
 
-    if not opts.strip:
-        roll.scan(0, "frame", roll.warmup)
-        return 1
+    scanner.cancelled = cancelled
+    try:
+        roll.prepare()
+        if not opts.strip:
+            roll.scan(0, "frame", roll.warmup)
+            return 1
+        n = _strip_frames(scanner, opts, roll, aligned, cancelled, log, between)
+    except Cancelled as e:  # the frames scanned so far have gone to on_frame already
+        log(f"stopped after {roll.done} frame(s): {e}")
+        n = roll.done
+        if not opts.strip:
+            return n
+    finally:
+        scanner.cancelled = None  # the eject is never broken off
+    if opts.eject:
+        log("ejecting the strip")
+        scanner.eject()
+    return n
+
+
+def _strip_frames(scanner, opts, roll, aligned, cancelled, log, between):
     try:
         scanner.align_frame(warmup=roll.warmup)
     except EndOfFilm:
@@ -359,6 +384,8 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
             between(n)
         if (opts.frames and n >= opts.frames) or (scanner.dry_run and n >= 2):  # a dry run shows one advance
             break
+        if cancelled and cancelled():  # not after the advance: stop where the film lies
+            break
         try:
             scanner.advance_frame(opts.pitch_mm, upto=scanner.next_frame_edge(frame) if frame else None,
                                   frame=frame if opts.predict else None)
@@ -379,9 +406,6 @@ def scan_frames(scanner, opts, on_frame, on_align=None, progress=None, before_sc
             # the roll is not lost; a second one in a row ends the strip
             log(f"no frame edge with film in the gate after frame {n}; scanning it as it lies and going on")
             kind = "unaligned"
-    if opts.eject:
-        log("ejecting the strip")
-        scanner.eject()
     return n
 
 
