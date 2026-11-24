@@ -473,7 +473,8 @@ dragging on the other.
 
 **Rewind** to scan again: coarse units back (6 then 7) one at a time. Only start from a sensor state that says where the strip is: pressing on past
 the start pushes the strip out of the entrance. Bit 6 clears about 760 px in from the auto-load position, so feed 3 more units back after it
-clears. With bit 6 clear and bit 7 set, the strip is at its start already, so nothing should move.
+clears. With bit 6 clear and bit 7 set, the strip is at its start already, so nothing should move. A whole 33-frame roll took 317 units
+back from its end (about 9.6 a frame, about 3.4 s a unit, warmA), so allow a few hundred.
 
 ### Moving by hand
 
@@ -508,8 +509,11 @@ None of this is protocol, but a driver will want it. Each is the host's job, sin
 
 - **Flat-field**: open light from the calibration window at step 30 and dark at step 700, 64 lines each, per pixel, at the same settings as the scan.
 - **Response sag along a roll**: open light fell 14 % over 39 frames, caused by scanning and not lamp age, and each frame's clear film tracked it. Read open
-  light before the first two frames and then every third, take the trend for the frames between, and scale each frame to frame 1. Seek home before each
-  reading: the tracked position drifts over a long run.
+  light before the first six frames and then every third, take the trend for the frames between, and scale each frame to frame 1. Seek home before each
+  reading: the tracked position drifts over a long run. The fall follows the lamp being lit and scanning, not the time of day: from a rest it rose for
+  6 minutes, then fell 20 to 27 % over about 100 minutes of scanning (time constant about 28 minutes) and held there (warmA, prewarmB); a warm run
+  held within 1.5 % over 14 frames (warmB). The first readings carry the most fall on a cold run, and on a warm one a trend taken from two of them
+  carries their noise on (warmB: frames 3 and 4 scaled 3 to 5 % too far after reading every frame from frame 3 only), so the first frames are all read.
 - **Falloff along the CCD**: about 0.95 of the middle at a frame's left end and 0.88 at its right.
 - **The response bends before the gain.** A stepped wedge scanned at four line periods (0xCB to 0x9F) and gains 4 to 11 puts every
   step on one curve of the level before the gain, L (the count less the black level, over the gain's factor): reading = light x

@@ -163,7 +163,9 @@ HOLE_WINDOW = (960, 1670)  # CCD pixels of the hole window
 PERF_PITCH = 341  # pixels between sprocket holes (4.75 mm)
 PX_PER_MM = PERF_PITCH / 4.75
 FINE_PX, COARSE_LEFT, FEED_TOLERANCE = 15.0, 345, 8  # fine units close the last COARSE_LEFT pixels to within the tolerance
-REWIND_MAX = 64  # coarse units rewind() may feed back: a 6-frame strip is about 50 (8 per frame); its end took 23 for 3
+REWIND_MAX = 64  # coarse units a seek back may feed at once (longer trips back are not tested); a 6-frame strip is about 50
+REWIND_MOST = 480  # coarse units rewind() may feed back: a whole roll from its end (warmA, 33 frames: 317 units, about 9.6 a
+# frame, at about 3.4 s a unit); it was REWIND_MAX, which stopped the rewind of that roll after 64
 EJECT_BURSTS = 48  # bursts of 8 coarse units eject() may send while page B bit 6 sees film: 384 units, about 1.7 m at
 # about 4.5 mm a unit, more than a whole 36-exposure roll (about 39 frames of 8 to 10 units). It was 8 (64 units, about 7.5
 # frames), which is plenty at the end of a scan but stopped an eject from the middle of a roll (the drive window) as stuck.
@@ -2224,7 +2226,7 @@ class PF1800:
             raise ScannerError(f"page B bit 6 still sees film after {bursts} bursts; the strip may be stuck")
         return burst()
 
-    def rewind(self, max_units=REWIND_MAX):
+    def rewind(self, max_units=REWIND_MOST):
         """Feed a caught strip back to where the feeder's auto-load holds it, to scan it again: coarse units back (6 + 7)
         one at a time until page B bit 6 has seen film and cleared behind the strip's leading end (the vendor's "back to
         start"), then REWIND_PAST more, as bit 6 clears short of where the auto-load holds a strip. With bit 6 clear and
